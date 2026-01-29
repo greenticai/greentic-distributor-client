@@ -999,9 +999,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-types"
-version = "0.4.34"
+version = "0.4.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbc14873ed29c9211a82f90137ca9e1ad2ae2d3e0ec47bbaf786dd6ceab14b2b"
+checksum = "09948953f0877624136343598bc5d999b28e940bd032683d92486a6a2eeedb3a"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1013,6 +1013,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "sha2",
  "thiserror 2.0.17",
  "time",
 ]
