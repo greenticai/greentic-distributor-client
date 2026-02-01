@@ -32,9 +32,10 @@ let resp = client.resolve_component(ResolveComponentRequest {
     extra: json!({}),
 }).await?;
 println!("artifact: {:?}", resp.artifact);
-if let Some(reqs) = resp.secret_requirements.as_ref() {
-    println!("secret requirements: {:?}", reqs);
-}
+println!(
+    "secret requirements present: {}",
+    resp.secret_requirements.is_some()
+);
 ```
 
 `GeneratedDistributorApiBindings` calls the distributor imports on WASM targets. On non-WASM targets it returns an error; consumers can provide their own bindings implementation for testing.
@@ -77,9 +78,10 @@ let resp = client.resolve_component(ResolveComponentRequest {
     extra: json!({}),
 }).await?;
 println!("artifact: {:?}", resp.artifact);
-if let Some(reqs) = resp.secret_requirements.as_ref() {
-    println!("secret requirements: {:?}", reqs);
-}
+println!(
+    "secret requirements present: {}",
+    resp.secret_requirements.is_some()
+);
 ```
 
 Fetch typed pack status (includes secret requirements):
@@ -93,8 +95,9 @@ let status = client
     )
     .await?;
 println!(
-    "status: {}, secrets: {:?}",
-    status.status, status.secret_requirements
+    "status: {}, secret requirements present: {}",
+    status.status,
+    status.secret_requirements.is_some()
 );
 ```
 

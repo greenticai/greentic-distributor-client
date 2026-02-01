@@ -187,16 +187,10 @@ impl DistClient {
                 reference: url.to_string(),
             });
         }
-        if !(url.starts_with("https://")
-            || (self.opts.allow_insecure_local_http && is_loopback_http(url)))
-        {
-            return Err(DistError::InsecureUrl {
-                url: url.to_string(),
-            });
-        }
+        let request_url = ensure_secure_http_url(url, self.opts.allow_insecure_local_http)?;
         let bytes = self
             .http
-            .get(url)
+            .get(request_url.clone())
             .send()
             .await?
             .error_for_status()?
@@ -208,7 +202,7 @@ impl DistClient {
             cache_path: Some(path),
             digest,
             fetched: true,
-            source: ArtifactSource::Http(url.to_string()),
+            source: ArtifactSource::Http(request_url.to_string()),
         })
     }
 
@@ -443,16 +437,21 @@ fn is_digest(s: &str) -> bool {
     s.starts_with("sha256:") && s.len() == "sha256:".len() + 64
 }
 
-fn is_loopback_http(url: &str) -> bool {
-    if let Ok(parsed) = Url::parse(url) {
-        if parsed.scheme() != "http" {
-            return false;
-        }
-        if let Some(host) = parsed.host_str() {
-            return host == "localhost" || host == "127.0.0.1";
-        }
+fn is_loopback_http(url: &Url) -> bool {
+    url.scheme() == "http" && matches!(url.host_str(), Some("localhost") | Some("127.0.0.1"))
+}
+
+fn ensure_secure_http_url(url: &str, allow_loopback_local: bool) -> Result<Url, DistError> {
+    let parsed = Url::parse(url).map_err(|_| DistError::InvalidReference {
+        reference: url.to_string(),
+    })?;
+    if parsed.scheme() == "https" || (allow_loopback_local && is_loopback_http(&parsed)) {
+        Ok(parsed)
+    } else {
+        Err(DistError::InsecureUrl {
+            url: url.to_string(),
+        })
     }
-    false
 }
 
 #[derive(Debug, serde::Deserialize)]
