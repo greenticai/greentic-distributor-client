@@ -19,7 +19,7 @@ jobs:
       - name: Set up Rust
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
+          toolchain: 1.90.0
           override: true
           components: rustfmt, clippy
       - name: Cache cargo
