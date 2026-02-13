@@ -135,6 +135,13 @@ let resolved = client.ensure_cached("file:///tmp/my-component.wasm").await?;
 println!("digest: {}, path: {}", resolved.digest, resolved.cache_path.unwrap().display());
 ```
 
+`ResolvedArtifact` now includes additive optional metadata:
+- `describe_artifact_ref: Option<String>`
+- `content_length: Option<u64>`
+- `content_type: Option<String>`
+
+When `describe_artifact_ref` is present, it is advisory only. WASM `describe()` remains authoritative; downstream tools must verify any cached describe artifact against the wasm-derived `describe_hash`.
+
 ### Integration examples
 - Resolve a ref: `greentic-dist resolve oci://ghcr.io/greentic-ai/components/hello-world:1`
 - Pull everything from a lockfile: `greentic-dist pull --lock pack.lock.json`

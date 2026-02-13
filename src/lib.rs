@@ -19,7 +19,10 @@ mod wit_client;
 
 pub use config::DistributorClientConfig;
 #[cfg(feature = "dist-client")]
-pub use dist::{DistClient, DistOptions, ResolvedArtifact};
+pub use dist::{
+    DistClient, DistOptions, InjectedResolution, LockHint, ResolveRefInjector, ResolveRefRequest,
+    ResolvedArtifact,
+};
 pub use error::DistributorError;
 #[cfg(feature = "http-runtime")]
 pub use http::HttpDistributorClient;

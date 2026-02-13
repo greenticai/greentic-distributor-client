@@ -1,5 +1,4 @@
 use crate::dist::{DistClient, DistOptions};
-use crate::oci_components::default_cache_root;
 #[cfg(feature = "pack-fetch")]
 use crate::oci_packs::{
     DefaultRegistryClient, OciPackFetcher, PackFetchOptions, RegistryClient, ResolvedPack,
@@ -155,8 +154,6 @@ pub async fn run_with_pack_client<C: RegistryClient>(
     let mut opts = DistOptions::default();
     if let Some(dir) = cli.cache_dir {
         opts.cache_dir = dir;
-    } else {
-        opts.cache_dir = default_cache_root();
     }
     opts.offline = offline || opts.offline;
 

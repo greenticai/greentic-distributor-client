@@ -1,5 +1,5 @@
 [workspace.package]
-version = "0.4.28"
+version = "0.4.29"
 edition = "2024"
 
 [package]
@@ -22,6 +22,7 @@ pack-fetch = ["dirs-next", "oci-distribution", "sha2"]
 runner-api = ["dirs-next", "oci-distribution", "sha2"]
 dist-client = ["oci-components", "reqwest", "pack-fetch"]
 dist-cli = ["clap", "dist-client", "pack-fetch"]
+fixture-resolver = ["dist-client"]
 
 [workspace]
 members = [".", "greentic-distributor-dev"]
