@@ -62,6 +62,3 @@ required-features = ["dist-cli"]
 name = "greentic-distributor-client"
 path = "src/bin/greentic-distributor-client.rs"
 required-features = ["dist-cli"]
-
-[patch.crates-io]
-greentic-interfaces = { path = "../greentic-interfaces/crates/greentic-interfaces" }
