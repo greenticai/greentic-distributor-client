@@ -43,11 +43,11 @@
 - **Path:** `README.md` / `LICENSE`
   - **Role:** Crate metadata for publication (MIT license, description/usage overview, local dev distributor usage example).
 - **Path:** `.github/workflows/ci.yml`
-  - **Role:** CI workflow running fmt, clippy, tests, and a packaging check on pushes/PRs.
+  - **Role:** CI workflow running a bindings-path guard (`greentic_interfaces{,_guest}::bindings`), fmt, clippy, tests, and a packaging check on pushes/PRs.
 - **Path:** `.github/workflows/publish.yml`
   - **Role:** Publish workflow for crates.io on tags or manual dispatch using `CARGO_REGISTRY_TOKEN`; packages/publishes both client and dev crates.
 - **Path:** `ci/local_check.sh`
-  - **Role:** Local helper script running fmt, clippy, and tests.
+  - **Role:** Local helper script running a bindings-path guard (`greentic_interfaces{,_guest}::bindings`), fmt, clippy, and tests.
 - **Path:** `docs/oci_packs.md`
   - **Role:** Documentation for public OCI pack fetching, cache layout, and limitations.
 - **Path:** `README.md` / `LICENSE`
@@ -57,8 +57,10 @@
 - WIT integration uses a pluggable `DistributorApiBindings` trait; `GeneratedDistributorApiBindings` works on WASM targets and errors on non-WASM. HTTP runtime client is feature-gated (`http-runtime`) for environments where the runtime JSON surface is available. Dev distributor is ready for greentic-dev wiring.
 
 ## 4. Broken, Failing, or Conflicting Areas
-- None currently known. `ci/local_check.sh` (fmt + clippy + tests) passes with all features enabled, including `oci-components` and `pack-fetch`.
+- `tests/oci_components_e2e.rs` can fail in restricted environments because it pulls `ghcr.io/greentic-ai/components/templates:latest` and currently returns `UnauthorizedError` without GHCR/network access. `ci/local_check.sh` fails when `OCI_E2E=1` under those constraints.
 
 ## 5. Notes for Future Work
 - Confirm HTTP JSON field naming against the canonical distributor API and adjust serializers as needed.
 - Keep packaging checks in CI; publish workflow already runs `cargo package` for both crates.
+- Follow `.codex/PR-01-interfaces.md` in downstream repos: use `greentic_interfaces::canonical::*` only; do not import `greentic_interfaces::bindings::*` outside `greentic-interfaces`.
+- Workspace currently patches `greentic-interfaces` to local `../greentic-interfaces` and uses local-path `greentic-interfaces-guest` for PR work.

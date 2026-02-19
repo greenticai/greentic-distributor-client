@@ -15,11 +15,16 @@ jobs:
       - name: Set up Rust
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: 1.90.0
+          toolchain: 1.91.0
           override: true
           components: rustfmt, clippy
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+      - name: canonical interfaces guard
+        run: |
+          rg -n "greentic_interfaces::bindings::|greentic_interfaces_guest::bindings::|\bbindings::greentic::" src tests README.md \
+            && { echo "ERROR: use canonical/facade modules instead of bindings::* paths"; exit 1; } \
+            || true
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy

@@ -8,7 +8,6 @@ use crate::{
 use anyhow::anyhow;
 use async_trait::async_trait;
 use greentic_interfaces_guest::distributor_api as wit;
-use greentic_interfaces_guest::bindings::greentic_distributor_api_1_0_0_distributor_api::greentic::secrets_types::types as wit_secrets;
 #[cfg(target_arch = "wasm32")]
 use greentic_interfaces_guest::distributor_api::DistributorApiImports;
 use serde_json::Value;
@@ -292,23 +291,23 @@ fn from_wit_secret_requirements(
 }
 
 trait WitSecretRequirementsExt {
-    fn into_optional_vec(self) -> Option<Vec<wit_secrets::SecretRequirement>>;
+    fn into_optional_vec(self) -> Option<Vec<wit::SecretRequirement>>;
 }
 
-impl WitSecretRequirementsExt for Vec<wit_secrets::SecretRequirement> {
-    fn into_optional_vec(self) -> Option<Vec<wit_secrets::SecretRequirement>> {
+impl WitSecretRequirementsExt for Vec<wit::SecretRequirement> {
+    fn into_optional_vec(self) -> Option<Vec<wit::SecretRequirement>> {
         Some(self)
     }
 }
 
-impl WitSecretRequirementsExt for Option<Vec<wit_secrets::SecretRequirement>> {
-    fn into_optional_vec(self) -> Option<Vec<wit_secrets::SecretRequirement>> {
+impl WitSecretRequirementsExt for Option<Vec<wit::SecretRequirement>> {
+    fn into_optional_vec(self) -> Option<Vec<wit::SecretRequirement>> {
         self
     }
 }
 
 fn from_wit_secret_requirement(
-    req: wit_secrets::SecretRequirement,
+    req: wit::SecretRequirement,
 ) -> Result<SecretRequirement, DistributorError> {
     let key = SecretKey::parse(&req.key).map_err(|e| {
         DistributorError::InvalidResponse(format!("invalid secret key `{}`: {e}", req.key))
@@ -318,7 +317,12 @@ fn from_wit_secret_requirement(
         tenant: scope.tenant,
         team: scope.team,
     });
-    let format = req.format.map(from_wit_secret_format);
+    let format = req.format.map(|format| match format as u8 {
+        0 => SecretFormat::Bytes,
+        1 => SecretFormat::Text,
+        2 => SecretFormat::Json,
+        _ => unreachable!("unexpected WIT secret format discriminant"),
+    });
     let schema = match req.schema {
         Some(schema) => Some(serde_json::from_str(&schema)?),
         None => None,
@@ -332,12 +336,4 @@ fn from_wit_secret_requirement(
     requirement.schema = schema;
     requirement.examples = req.examples;
     Ok(requirement)
-}
-
-fn from_wit_secret_format(format: wit_secrets::SecretFormat) -> SecretFormat {
-    match format {
-        wit_secrets::SecretFormat::Bytes => SecretFormat::Bytes,
-        wit_secrets::SecretFormat::Text => SecretFormat::Text,
-        wit_secrets::SecretFormat::Json => SecretFormat::Json,
-    }
 }

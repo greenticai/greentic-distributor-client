@@ -1,5 +1,5 @@
 [workspace.package]
-version = "0.4.29"
+version = "0.4.30"
 edition = "2024"
 
 [package]
@@ -40,8 +40,8 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 anyhow = "1"
-greentic-types = { version = "0.4", features = ["schema"] }
-greentic-interfaces-guest = { version = "0.4", features = ["distributor-api", "distributor-api-imports"] }
+greentic-types = { version = ">=0.4.52", features = ["schema"] }
+greentic-interfaces-guest = {  version = "0.4", features = ["distributor-api", "distributor-api-imports"] }
 greentic-config-types = "0.4"
 semver = "1"
 oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"], optional = true }
@@ -62,3 +62,6 @@ required-features = ["dist-cli"]
 name = "greentic-distributor-client"
 path = "src/bin/greentic-distributor-client.rs"
 required-features = ["dist-cli"]
+
+[patch.crates-io]
+greentic-interfaces = { path = "../greentic-interfaces/crates/greentic-interfaces" }

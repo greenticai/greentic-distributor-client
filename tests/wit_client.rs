@@ -1,11 +1,10 @@
 use async_trait::async_trait;
 use greentic_distributor_client::{
     ArtifactLocation, ComponentDigest, ComponentStatus, DistributorApiBindings, DistributorClient,
-    DistributorEnvironmentId, EnvId, ResolveComponentRequest, SecretFormat, SecretScope, TenantCtx,
-    TenantId, WitDistributorClient,
+    DistributorEnvironmentId, EnvId, ResolveComponentRequest, TenantCtx, TenantId,
+    WitDistributorClient,
 };
 use greentic_interfaces_guest::distributor_api as wit;
-use greentic_interfaces_guest::bindings::greentic_distributor_api_1_0_0_distributor_api::greentic::secrets_types::types as wit_secrets;
 use serde_json::json;
 
 #[derive(Clone)]
@@ -40,12 +39,8 @@ impl DistributorApiBindings for DummyBindings {
                 key: "TEST_API_KEY".into(),
                 required: true,
                 description: Some("API key".into()),
-                scope: Some(wit_secrets::SecretScope {
-                    env: "dev".into(),
-                    tenant: "tenant-a".into(),
-                    team: None,
-                }),
-                format: Some(wit_secrets::SecretFormat::Text),
+                scope: None,
+                format: None,
                 schema: None,
                 examples: vec!["abc123".into()],
             }],
@@ -79,11 +74,7 @@ impl DistributorApiBindings for DummyBindings {
                 key: "TEST_API_KEY".into(),
                 required: true,
                 description: Some("pack status key".into()),
-                scope: Some(wit_secrets::SecretScope {
-                    env: "dev".into(),
-                    tenant: "tenant-a".into(),
-                    team: None,
-                }),
+                scope: None,
                 format: None,
                 schema: None,
                 examples: vec![],
@@ -138,15 +129,8 @@ async fn wit_resolve_component_translation() {
     let req = &reqs[0];
     assert_eq!(req.key.as_str(), "TEST_API_KEY");
     assert!(req.required);
-    assert_eq!(
-        req.scope,
-        Some(SecretScope {
-            env: "dev".into(),
-            tenant: "tenant-a".into(),
-            team: None
-        })
-    );
-    assert_eq!(req.format, Some(SecretFormat::Text));
+    assert_eq!(req.scope, None);
+    assert_eq!(req.format, None);
 }
 
 #[tokio::test]
