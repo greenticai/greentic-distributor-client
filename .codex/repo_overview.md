@@ -63,4 +63,3 @@
 - Confirm HTTP JSON field naming against the canonical distributor API and adjust serializers as needed.
 - Keep packaging checks in CI; publish workflow already runs `cargo package` for both crates.
 - Follow `.codex/PR-01-interfaces.md` in downstream repos: use `greentic_interfaces::canonical::*` only; do not import `greentic_interfaces::bindings::*` outside `greentic-interfaces`.
-- Workspace currently patches `greentic-interfaces` to local `../greentic-interfaces` and uses local-path `greentic-interfaces-guest` for PR work.

@@ -7,10 +7,12 @@ use std::cell::OnceCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const WASM_CONTENT_TYPE: &str = "application/wasm";
+static LAST_USED_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
 pub struct DistOptions {
@@ -818,7 +820,8 @@ impl ComponentCache {
 
     fn touch_last_used(&self, digest: &str) -> Result<(), std::io::Error> {
         let marker = self.component_dir(digest).join("last_used");
-        fs::write(marker, b"1")
+        let seq = LAST_USED_COUNTER.fetch_add(1, Ordering::Relaxed);
+        fs::write(marker, seq.to_string())
     }
 
     fn enforce_size_cap(&self, max_bytes: u64) -> Result<(), std::io::Error> {
@@ -830,7 +833,12 @@ impl ComponentCache {
         if total <= max_bytes {
             return Ok(());
         }
-        entries.sort_by_key(|entry| entry.last_used);
+        entries.sort_by(|a, b| {
+            a.last_used_seq
+                .cmp(&b.last_used_seq)
+                .then_with(|| a.last_used.cmp(&b.last_used))
+                .then_with(|| a.dir.cmp(&b.dir))
+        });
         for entry in entries {
             if total <= max_bytes {
                 break;
@@ -860,6 +868,11 @@ impl ComponentCache {
                 continue;
             }
             let size = wasm.metadata()?.len();
+            let marker = dir.join("last_used");
+            let last_used_seq = fs::read_to_string(&marker)
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+                .unwrap_or(0);
             let last_used = dir
                 .join("last_used")
                 .metadata()
@@ -869,6 +882,7 @@ impl ComponentCache {
             out.push(CacheEntry {
                 dir,
                 size,
+                last_used_seq,
                 last_used,
             });
         }
@@ -880,6 +894,7 @@ impl ComponentCache {
 struct CacheEntry {
     dir: PathBuf,
     size: u64,
+    last_used_seq: u64,
     last_used: SystemTime,
 }
 
