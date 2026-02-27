@@ -94,7 +94,7 @@ async fn resolves_digest_pinned_and_caches() {
     let temp = tempfile::tempdir().unwrap();
     let data = br#"{"pack":"bytes"}"#;
     let digest = digest_for(data);
-    let reference = format!("ghcr.io/greentic-ai/greentic-packs/foo@{digest}");
+    let reference = format!("ghcr.io/greenticai/greentic-packs/foo@{digest}");
 
     let mock = MockRegistryClient::with_image(
         &reference,
@@ -123,7 +123,7 @@ async fn tag_refs_rejected_without_opt_in() {
     let temp = tempfile::tempdir().unwrap();
     let fetcher = OciPackFetcher::with_client(MockRegistryClient::default(), options(&temp));
     let err = fetcher
-        .fetch_pack_to_cache("ghcr.io/greentic-ai/greentic-packs/foo:latest")
+        .fetch_pack_to_cache("ghcr.io/greenticai/greentic-packs/foo:latest")
         .await
         .unwrap_err();
     assert!(matches!(err, OciPackError::TagDisallowed { .. }));
@@ -134,7 +134,7 @@ async fn offline_mode_requires_cache() {
     let temp = tempfile::tempdir().unwrap();
     let data = br#"{"pack":"bytes"}"#;
     let digest = digest_for(data);
-    let reference = format!("ghcr.io/greentic-ai/greentic-packs/foo@{digest}");
+    let reference = format!("ghcr.io/greenticai/greentic-packs/foo@{digest}");
     let mut opts = options(&temp);
     opts.offline = true;
     let fetcher = OciPackFetcher::with_client(MockRegistryClient::default(), opts);
@@ -148,7 +148,7 @@ async fn allows_tag_refs_when_opted_in() {
     let temp = tempfile::tempdir().unwrap();
     let data = br#"{"pack":"bytes"}"#;
     let digest = digest_for(data);
-    let reference = "ghcr.io/greentic-ai/greentic-packs/foo:latest";
+    let reference = "ghcr.io/greenticai/greentic-packs/foo:latest";
 
     let mut opts = options(&temp);
     opts.allow_tags = true;
@@ -170,7 +170,7 @@ async fn prefers_pack_media_type_when_present() {
     let first_bytes = br#"{"pack":"fallback"}"#;
     let preferred_bytes = br#"{"pack":"preferred"}"#;
     let preferred_digest = digest_for(preferred_bytes);
-    let reference = format!("ghcr.io/greentic-ai/greentic-packs/foo@{preferred_digest}");
+    let reference = format!("ghcr.io/greenticai/greentic-packs/foo@{preferred_digest}");
 
     let image = pulled_image_with_layers(vec![
         PulledLayer {
@@ -197,7 +197,7 @@ async fn accepts_zip_pack_media_type() {
     let temp = tempfile::tempdir().unwrap();
     let zip_bytes = b"zip-pack-bytes";
     let digest = digest_for(zip_bytes);
-    let reference = format!("ghcr.io/greentic-ai/greentic-packs/foo@{digest}");
+    let reference = format!("ghcr.io/greenticai/greentic-packs/foo@{digest}");
 
     let image = pulled_image_with_layers(vec![PulledLayer {
         media_type: "application/vnd.greentic.gtpack.v1+zip".to_string(),
@@ -217,7 +217,7 @@ async fn accepts_markdown_pack_media_type() {
     let temp = tempfile::tempdir().unwrap();
     let md_bytes = b"# pack\n";
     let digest = digest_for(md_bytes);
-    let reference = format!("ghcr.io/greentic-ai/greentic-packs/foo@{digest}");
+    let reference = format!("ghcr.io/greenticai/greentic-packs/foo@{digest}");
 
     let image = pulled_image_with_layers(vec![PulledLayer {
         media_type: "text/markdown".to_string(),
@@ -258,7 +258,7 @@ async fn accepts_additional_pack_media_types() {
 
     for (idx, (media_type, bytes)) in cases.iter().enumerate() {
         let digest = digest_for(bytes);
-        let reference = format!("ghcr.io/greentic-ai/greentic-packs/foo{idx}@{digest}");
+        let reference = format!("ghcr.io/greenticai/greentic-packs/foo{idx}@{digest}");
         let image = pulled_image_with_layers(vec![PulledLayer {
             media_type: (*media_type).to_string(),
             data: bytes.to_vec(),
@@ -278,7 +278,7 @@ async fn accepts_custom_layer_media_type_override() {
     let temp = tempfile::tempdir().unwrap();
     let bytes = b"<html>pack</html>";
     let digest = digest_for(bytes);
-    let reference = format!("ghcr.io/greentic-ai/greentic-packs/foo@{digest}");
+    let reference = format!("ghcr.io/greenticai/greentic-packs/foo@{digest}");
 
     let image = pulled_image_with_layers(vec![PulledLayer {
         media_type: "text/html".to_string(),
@@ -301,7 +301,7 @@ async fn falls_back_to_first_layer_without_preferred_media_type() {
     let first_bytes = br#"{"pack":"first"}"#;
     let second_bytes = br#"{"pack":"second"}"#;
     let digest = digest_for(first_bytes);
-    let reference = format!("ghcr.io/greentic-ai/greentic-packs/foo@{digest}");
+    let reference = format!("ghcr.io/greenticai/greentic-packs/foo@{digest}");
 
     let image = pulled_image_with_layers(vec![
         PulledLayer {
@@ -328,7 +328,7 @@ async fn digest_mismatch_surfaces_error() {
     let temp = tempfile::tempdir().unwrap();
     let data = br#"{"pack":"bytes"}"#;
     let digest = digest_for(data);
-    let reference = "ghcr.io/greentic-ai/greentic-packs/foo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let reference = "ghcr.io/greenticai/greentic-packs/foo@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     let mock = MockRegistryClient::with_image(
         reference,
@@ -347,3 +347,4 @@ async fn invalid_reference_surfaces_error() {
     let err = fetcher.fetch_pack_to_cache("not a ref").await.unwrap_err();
     assert!(matches!(err, OciPackError::InvalidReference { .. }));
 }
+

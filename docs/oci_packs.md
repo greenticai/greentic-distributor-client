@@ -23,7 +23,7 @@ Use the helper APIs or the fetcher directly:
 ```rust
 use greentic_distributor_client::fetch_pack;
 
-let bytes = fetch_pack("ghcr.io/greentic-ai/greentic-packs/foo@sha256:...").await?;
+let bytes = fetch_pack("ghcr.io/greenticai/greentic-packs/foo@sha256:...").await?;
 ```
 
 ```rust
@@ -31,7 +31,7 @@ use greentic_distributor_client::{OciPackFetcher, PackFetchOptions};
 
 let fetcher = OciPackFetcher::new(PackFetchOptions::default());
 let resolved = fetcher
-    .fetch_pack_to_cache("ghcr.io/greentic-ai/greentic-packs/foo@sha256:...")
+    .fetch_pack_to_cache("ghcr.io/greenticai/greentic-packs/foo@sha256:...")
     .await?;
 println!("cached at {:?}", resolved.path);
 ```
@@ -49,3 +49,4 @@ Each digest is stored at `<cache>/<sha256>/pack.gtpack` with `metadata.json`.
 - No registry auth (public GHCR only).
 - Digest pins are enforced by default (tags require `allow_tags = true`).
 - No signature/provenance verification.
+

@@ -13,7 +13,7 @@ async fn fetches_public_component_from_ghcr() {
     }
 
     let reference = std::env::var("OCI_E2E_REF")
-        .unwrap_or_else(|_| "ghcr.io/greentic-ai/components/templates:latest".into());
+        .unwrap_or_else(|_| "ghcr.io/greenticai/components/templates:latest".into());
     let temp = tempfile::tempdir().expect("tempdir");
     let resolver: OciComponentResolver<
         greentic_distributor_client::oci_components::DefaultRegistryClient,
@@ -66,3 +66,4 @@ async fn fetches_public_component_from_ghcr() {
         "manifest digest should be recorded for future verification"
     );
 }
+

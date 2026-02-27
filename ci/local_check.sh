@@ -21,5 +21,6 @@ run_cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 echo ">> tests"
 export OCI_E2E=${OCI_E2E:-0}
-export OCI_E2E_REF=${OCI_E2E_REF:-ghcr.io/greentic-ai/components/templates:latest}
+export OCI_E2E_REF=${OCI_E2E_REF:-ghcr.io/greenticai/components/templates:latest}
 run_cargo test --workspace --all-features
+

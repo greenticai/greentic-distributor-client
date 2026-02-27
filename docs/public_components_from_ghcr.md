@@ -14,7 +14,7 @@ Pack manifests can surface component refs via an extension block:
 extensions:
   greentic.components:
     refs:
-      - "ghcr.io/greentic-ai/components/component-templates@sha256:..." # preferred
+      - "ghcr.io/greenticai/components/component-templates@sha256:..." # preferred
     mode: "eager" # or "lazy" (optional, defaults to eager)
 ```
 
@@ -30,7 +30,7 @@ use greentic_distributor_client::oci_components::{
 };
 
 let ext = ComponentsExtension {
-    refs: vec![ "ghcr.io/greentic-ai/components/component-templates@sha256:<digest>".into() ],
+    refs: vec![ "ghcr.io/greenticai/components/component-templates@sha256:<digest>".into() ],
     mode: ComponentsMode::Eager,
 };
 
@@ -66,7 +66,7 @@ Behavior:
 Run an opt-in E2E against the public component template (requires outbound network):
 
 ```bash
-OCI_E2E=1 OCI_E2E_REF=ghcr.io/greentic-ai/components/templates:latest \
+OCI_E2E=1 OCI_E2E_REF=ghcr.io/greenticai/components/templates:latest \
   cargo test --features oci-components --test oci_components_e2e -- --nocapture
 ```
 
@@ -74,3 +74,4 @@ The test:
 - Pulls anonymously from GHCR (tags allowed for this E2E).
 - Caches under a temp dir and records the manifest digest for future verification.
 - Skips automatically unless `OCI_E2E=1` is set.
+

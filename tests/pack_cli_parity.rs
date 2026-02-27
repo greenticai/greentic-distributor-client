@@ -83,7 +83,7 @@ fn pulled_image(data: &[u8], media_type: &str, digest: &str) -> PulledImage {
 async fn cli_and_api_pack_fetch_match() {
     let data = b"zip-pack-bytes";
     let digest = digest_for(data);
-    let reference = format!("ghcr.io/greentic-ai/greentic-packs/foo@{digest}");
+    let reference = format!("ghcr.io/greenticai/greentic-packs/foo@{digest}");
 
     let image = pulled_image(data, "application/vnd.greentic.gtpack.v1+zip", &digest);
     let mock = MockRegistryClient::with_image(&reference, image);
@@ -114,3 +114,4 @@ async fn cli_and_api_pack_fetch_match() {
     let cli_bytes = std::fs::read(&cli_resolved.path).unwrap();
     assert_eq!(cli_bytes, direct_bytes);
 }
+

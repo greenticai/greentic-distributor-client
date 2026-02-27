@@ -105,7 +105,7 @@ println!(
 Build with the CLI feature to get the `greentic-dist` binary:
 
 ```bash
-cargo run --features dist-cli --bin greentic-dist -- resolve ghcr.io/greentic-ai/components/templates:latest
+cargo run --features dist-cli --bin greentic-dist -- resolve ghcr.io/greenticai/components/templates:latest
 ```
 
 Commands:
@@ -143,7 +143,7 @@ println!("digest: {}, path: {}", resolved.digest, resolved.cache_path.unwrap().d
 When `describe_artifact_ref` is present, it is advisory only. WASM `describe()` remains authoritative; downstream tools must verify any cached describe artifact against the wasm-derived `describe_hash`.
 
 ### Integration examples
-- Resolve a ref: `greentic-dist resolve oci://ghcr.io/greentic-ai/components/hello-world:1`
+- Resolve a ref: `greentic-dist resolve oci://ghcr.io/greenticai/components/hello-world:1`
 - Pull everything from a lockfile: `greentic-dist pull --lock pack.lock.json`
 - Offline workflow: `greentic-dist pull --lock pack.lock.json` then `greentic-runner run mypack.gtpack --offline`
 
@@ -178,3 +178,4 @@ println!("Loaded {} bytes", pack_bytes.len());
 ## Repo maintenance
 - Enable GitHub's "Allow auto-merge" setting for the repository.
 - Configure branch protection with the required checks you want enforced before merges.
+

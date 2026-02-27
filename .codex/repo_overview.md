@@ -57,9 +57,10 @@
 - WIT integration uses a pluggable `DistributorApiBindings` trait; `GeneratedDistributorApiBindings` works on WASM targets and errors on non-WASM. HTTP runtime client is feature-gated (`http-runtime`) for environments where the runtime JSON surface is available. Dev distributor is ready for greentic-dev wiring.
 
 ## 4. Broken, Failing, or Conflicting Areas
-- `tests/oci_components_e2e.rs` can fail in restricted environments because it pulls `ghcr.io/greentic-ai/components/templates:latest` and currently returns `UnauthorizedError` without GHCR/network access. `ci/local_check.sh` fails when `OCI_E2E=1` under those constraints.
+- `tests/oci_components_e2e.rs` can fail in restricted environments because it pulls `ghcr.io/greenticai/components/templates:latest` and currently returns `UnauthorizedError` without GHCR/network access. `ci/local_check.sh` fails when `OCI_E2E=1` under those constraints.
 
 ## 5. Notes for Future Work
 - Confirm HTTP JSON field naming against the canonical distributor API and adjust serializers as needed.
 - Keep packaging checks in CI; publish workflow already runs `cargo package` for both crates.
 - Follow `.codex/PR-01-interfaces.md` in downstream repos: use `greentic_interfaces::canonical::*` only; do not import `greentic_interfaces::bindings::*` outside `greentic-interfaces`.
+
