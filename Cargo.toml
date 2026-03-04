@@ -1,5 +1,5 @@
 [workspace.package]
-version = "0.4.31"
+version = "0.4.32"
 edition = "2024"
 
 [package]
@@ -8,8 +8,8 @@ version.workspace=true
 edition = "2024"
 description = "WIT-based client for the greentic:distributor-api@1.0.0 distributor resolver."
 license = "MIT"
-repository = "https://github.com/greentic/greentic-distributor-client"
-homepage = "https://gihub.com/greentic"
+repository = "https://github.com/greenticai/greentic-distributor-client"
+homepage = "https://greentic.ai"
 readme = "README.md"
 keywords = ["greentic", "distributor", "wasm", "wit"]
 categories = ["network-programming", "wasm"]

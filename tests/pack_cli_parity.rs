@@ -114,4 +114,3 @@ async fn cli_and_api_pack_fetch_match() {
     let cli_bytes = std::fs::read(&cli_resolved.path).unwrap();
     assert_eq!(cli_bytes, direct_bytes);
 }
-

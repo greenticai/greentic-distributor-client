@@ -66,4 +66,3 @@ async fn fetches_public_component_from_ghcr() {
         "manifest digest should be recorded for future verification"
     );
 }
-

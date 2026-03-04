@@ -347,4 +347,3 @@ async fn invalid_reference_surfaces_error() {
     let err = fetcher.fetch_pack_to_cache("not a ref").await.unwrap_err();
     assert!(matches!(err, OciPackError::InvalidReference { .. }));
 }
-
