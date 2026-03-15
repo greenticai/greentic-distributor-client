@@ -8,6 +8,7 @@ use std::sync::{
 
 use greentic_distributor_client::oci_packs::{
     OciPackError, OciPackFetcher, PackFetchOptions, PulledImage, PulledLayer, RegistryClient,
+    default_pack_layer_media_types, fetch_pack_to_cache_with_options_and_client,
 };
 use oci_distribution::Reference;
 use oci_distribution::errors::OciDistributionError;
@@ -293,6 +294,68 @@ async fn accepts_custom_layer_media_type_override() {
     let resolved = fetcher.fetch_pack_to_cache(&reference).await.unwrap();
     let cached = std::fs::read(&resolved.path).unwrap();
     assert_eq!(cached, bytes);
+}
+
+#[tokio::test]
+async fn accepts_custom_tarball_media_type_when_appended() {
+    let temp = tempfile::tempdir().unwrap();
+    let bytes = b"zain-bundle";
+    let digest = digest_for(bytes);
+    let reference = format!("ghcr.io/greenticai/greentic-packs/foo@{digest}");
+
+    let image = pulled_image_with_layers(vec![PulledLayer {
+        media_type: "application/vnd.greentic.zain-x.bundle.v1+tar+gzip".to_string(),
+        data: bytes.to_vec(),
+        digest: Some(digest.clone()),
+    }]);
+    let mock = MockRegistryClient::with_image(&reference, image);
+    let opts = PackFetchOptions::default()
+        .add_accepted_layer_media_type("application/vnd.greentic.zain-x.bundle.v1+tar+gzip");
+    let fetcher = OciPackFetcher::with_client(
+        mock,
+        PackFetchOptions {
+            cache_dir: temp.path().to_path_buf(),
+            ..opts
+        },
+    );
+
+    let resolved = fetcher.fetch_pack_to_cache(&reference).await.unwrap();
+    let cached = std::fs::read(&resolved.path).unwrap();
+    assert_eq!(cached, bytes);
+}
+
+#[tokio::test]
+async fn top_level_fetch_helper_accepts_custom_tarball_media_type_when_appended() {
+    let temp = tempfile::tempdir().unwrap();
+    let bytes = b"zain-bundle-top-level";
+    let digest = digest_for(bytes);
+    let reference = format!("ghcr.io/greenticai/greentic-packs/top@{digest}");
+
+    let image = pulled_image_with_layers(vec![PulledLayer {
+        media_type: "application/vnd.greentic.zain-x.bundle.v1+tar+gzip".to_string(),
+        data: bytes.to_vec(),
+        digest: Some(digest.clone()),
+    }]);
+    let mock = MockRegistryClient::with_image(&reference, image);
+    let opts = PackFetchOptions {
+        cache_dir: temp.path().to_path_buf(),
+        ..PackFetchOptions::default()
+            .add_accepted_layer_media_type("application/vnd.greentic.zain-x.bundle.v1+tar+gzip")
+    };
+
+    let via_helper = fetch_pack_to_cache_with_options_and_client(&reference, opts, mock)
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(via_helper.path).unwrap(), bytes);
+}
+
+#[test]
+fn default_pack_media_types_cover_current_exact_allowlist() {
+    let media_types = default_pack_layer_media_types();
+    assert!(media_types.contains(&"application/vnd.oci.image.layer.v1.tar".to_string()));
+    assert!(media_types.contains(&"application/vnd.oci.image.layer.v1.tar+gzip".to_string()));
+    assert!(media_types.contains(&"application/vnd.oci.image.layer.v1.tar+zstd".to_string()));
 }
 
 #[tokio::test]

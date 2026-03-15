@@ -8,7 +8,7 @@ use oci_distribution::client::{Client, ClientConfig, ClientProtocol, ImageData};
 use oci_distribution::errors::OciDistributionError;
 use oci_distribution::manifest::{
     IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE,
-    OCI_IMAGE_MEDIA_TYPE,
+    OCI_IMAGE_MEDIA_TYPE, OciManifest,
 };
 use oci_distribution::secrets::RegistryAuth;
 use serde::{Deserialize, Serialize};
@@ -65,27 +65,52 @@ impl Default for PackFetchOptions {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
-            accepted_layer_media_types: vec![
-                PACK_LAYER_MEDIA_TYPE.to_string(),
-                PACK_LAYER_MEDIA_TYPE_ZIP.to_string(),
-                PACK_LAYER_MEDIA_TYPE_ZIP_LEGACY.to_string(),
-                PACK_LAYER_MEDIA_TYPE_PACK_ZIP.to_string(),
-                PACK_LAYER_MEDIA_TYPE_MARKDOWN.to_string(),
-                PACK_LAYER_MEDIA_TYPE_OCTET_STREAM.to_string(),
-                PACK_LAYER_MEDIA_TYPE_JSON.to_string(),
-                PACK_LAYER_MEDIA_TYPE_TAR.to_string(),
-                PACK_LAYER_MEDIA_TYPE_TAR_GZIP.to_string(),
-                PACK_LAYER_MEDIA_TYPE_TAR_ZSTD.to_string(),
-            ],
-            preferred_layer_media_types: vec![
-                PACK_LAYER_MEDIA_TYPE.to_string(),
-                PACK_LAYER_MEDIA_TYPE_ZIP.to_string(),
-                PACK_LAYER_MEDIA_TYPE_ZIP_LEGACY.to_string(),
-                PACK_LAYER_MEDIA_TYPE_PACK_ZIP.to_string(),
-                PACK_LAYER_MEDIA_TYPE_MARKDOWN.to_string(),
-            ],
+            accepted_layer_media_types: default_pack_layer_media_types(),
+            preferred_layer_media_types: default_preferred_pack_layer_media_types(),
         }
     }
+}
+
+impl PackFetchOptions {
+    pub fn add_accepted_layer_media_type(mut self, media_type: impl Into<String>) -> Self {
+        self.accepted_layer_media_types.push(media_type.into());
+        self
+    }
+
+    pub fn add_accepted_layer_media_types<I, S>(mut self, media_types: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.accepted_layer_media_types
+            .extend(media_types.into_iter().map(Into::into));
+        self
+    }
+}
+
+pub fn default_pack_layer_media_types() -> Vec<String> {
+    vec![
+        PACK_LAYER_MEDIA_TYPE.to_string(),
+        PACK_LAYER_MEDIA_TYPE_ZIP.to_string(),
+        PACK_LAYER_MEDIA_TYPE_ZIP_LEGACY.to_string(),
+        PACK_LAYER_MEDIA_TYPE_PACK_ZIP.to_string(),
+        PACK_LAYER_MEDIA_TYPE_MARKDOWN.to_string(),
+        PACK_LAYER_MEDIA_TYPE_OCTET_STREAM.to_string(),
+        PACK_LAYER_MEDIA_TYPE_JSON.to_string(),
+        PACK_LAYER_MEDIA_TYPE_TAR.to_string(),
+        PACK_LAYER_MEDIA_TYPE_TAR_GZIP.to_string(),
+        PACK_LAYER_MEDIA_TYPE_TAR_ZSTD.to_string(),
+    ]
+}
+
+pub fn default_preferred_pack_layer_media_types() -> Vec<String> {
+    vec![
+        PACK_LAYER_MEDIA_TYPE.to_string(),
+        PACK_LAYER_MEDIA_TYPE_ZIP.to_string(),
+        PACK_LAYER_MEDIA_TYPE_ZIP_LEGACY.to_string(),
+        PACK_LAYER_MEDIA_TYPE_PACK_ZIP.to_string(),
+        PACK_LAYER_MEDIA_TYPE_MARKDOWN.to_string(),
+    ]
 }
 
 /// Result of fetching a single pack reference.
@@ -240,8 +265,46 @@ pub async fn fetch_pack(oci_ref: &str) -> Result<Vec<u8>, OciPackError> {
     OciPackFetcher::default().fetch_pack(oci_ref).await
 }
 
+pub async fn fetch_pack_with_options(
+    oci_ref: &str,
+    opts: PackFetchOptions,
+) -> Result<Vec<u8>, OciPackError> {
+    OciPackFetcher::<DefaultRegistryClient>::new(opts)
+        .fetch_pack(oci_ref)
+        .await
+}
+
+pub async fn fetch_pack_with_options_and_client<C: RegistryClient>(
+    oci_ref: &str,
+    opts: PackFetchOptions,
+    client: C,
+) -> Result<Vec<u8>, OciPackError> {
+    OciPackFetcher::with_client(client, opts)
+        .fetch_pack(oci_ref)
+        .await
+}
+
 pub async fn fetch_pack_to_cache(oci_ref: &str) -> Result<ResolvedPack, OciPackError> {
     OciPackFetcher::default().fetch_pack_to_cache(oci_ref).await
+}
+
+pub async fn fetch_pack_to_cache_with_options(
+    oci_ref: &str,
+    opts: PackFetchOptions,
+) -> Result<ResolvedPack, OciPackError> {
+    OciPackFetcher::<DefaultRegistryClient>::new(opts)
+        .fetch_pack_to_cache(oci_ref)
+        .await
+}
+
+pub async fn fetch_pack_to_cache_with_options_and_client<C: RegistryClient>(
+    oci_ref: &str,
+    opts: PackFetchOptions,
+    client: C,
+) -> Result<ResolvedPack, OciPackError> {
+    OciPackFetcher::with_client(client, opts)
+        .fetch_pack_to_cache(oci_ref)
+        .await
 }
 
 fn select_layer<'a>(
@@ -432,17 +495,82 @@ impl RegistryClient for DefaultRegistryClient {
     async fn pull(
         &self,
         reference: &Reference,
-        accepted_manifest_types: &[&str],
+        accepted_media_types: &[&str],
     ) -> Result<PulledImage, OciDistributionError> {
+        let accepted_media_types = self
+            .expand_accepted_media_types(reference, accepted_media_types)
+            .await?;
+        let accepted_media_type_refs = accepted_media_types
+            .iter()
+            .map(|media_type| media_type.as_str())
+            .collect::<Vec<_>>();
         let image = self
             .inner
             .pull(
                 reference,
                 &RegistryAuth::Anonymous,
-                accepted_manifest_types.to_vec(),
+                accepted_media_type_refs,
             )
             .await?;
         Ok(convert_image(image))
+    }
+}
+
+impl DefaultRegistryClient {
+    async fn expand_accepted_media_types(
+        &self,
+        reference: &Reference,
+        accepted_media_types: &[&str],
+    ) -> Result<Vec<String>, OciDistributionError> {
+        let mut accepted = accepted_media_types
+            .iter()
+            .map(|media_type| (*media_type).to_string())
+            .collect::<Vec<_>>();
+        let (manifest, _) = self
+            .inner
+            .pull_manifest(reference, &RegistryAuth::Anonymous)
+            .await?;
+        if let OciManifest::Image(image_manifest) = manifest {
+            for layer in image_manifest.layers {
+                if accepted
+                    .iter()
+                    .any(|accepted| accepted == &layer.media_type)
+                {
+                    continue;
+                }
+                if is_generic_tarball_media_type(&layer.media_type) {
+                    accepted.push(layer.media_type);
+                }
+            }
+        }
+        Ok(accepted)
+    }
+}
+
+fn is_generic_tarball_media_type(media_type: &str) -> bool {
+    media_type.ends_with("+tar")
+        || media_type.ends_with("+tar+gzip")
+        || media_type.ends_with("+tar+zstd")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_generic_tarball_media_type;
+
+    #[test]
+    fn generic_tarball_media_types_are_allowed() {
+        assert!(is_generic_tarball_media_type(
+            "application/vnd.greentic.zain-x.bundle.v1+tar"
+        ));
+        assert!(is_generic_tarball_media_type(
+            "application/vnd.greentic.zain-x.bundle.v1+tar+gzip"
+        ));
+        assert!(is_generic_tarball_media_type(
+            "application/vnd.greentic.zain-x.bundle.v1+tar+zstd"
+        ));
+        assert!(!is_generic_tarball_media_type(
+            "application/vnd.greentic.zain-x.bundle.v1+zip"
+        ));
     }
 }
 

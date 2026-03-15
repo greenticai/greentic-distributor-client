@@ -127,6 +127,10 @@ Exit codes:
 ## Library API (feature `dist-client`)
 Use `DistClient` to reuse the same resolution and cache logic programmatically. The `dist-client` feature also includes the OCI pack fetcher APIs (`fetch_pack`, `OciPackFetcher`).
 
+`OciPackFetcher` accepts the default Greentic pack media types plus opaque tarball-style OCI layer media types ending in `+tar`, `+tar+gzip`, or `+tar+zstd`. Downstream clients can append exact custom layer media types through `PackFetchOptions::add_accepted_layer_media_type(...)` without copying the default allowlist, which is also exposed via `default_pack_layer_media_types()`.
+
+For callers that prefer the crate-level helpers over constructing `OciPackFetcher` directly, use `fetch_pack_with_options(...)` or `fetch_pack_to_cache_with_options(...)`. Test-only or advanced integrations can also inject a custom registry client through `fetch_pack_with_options_and_client(...)` / `fetch_pack_to_cache_with_options_and_client(...)`.
+
 The canonical PR-01 flow is:
 
 1. build an `ArtifactSource`
