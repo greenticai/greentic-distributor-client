@@ -48,6 +48,10 @@ pub use oci_packs::{OciPackError, OciPackFetcher, PackFetchOptions, ResolvedPack
 #[cfg(feature = "pack-fetch")]
 pub use oci_packs::{fetch_pack, fetch_pack_to_cache};
 pub use source::{ChainedDistributorSource, DistributorSource};
+pub use store_auth::{
+    StoreAuth, StoreAuthError, StoreCredentials, load_login, load_login_default, save_login,
+    save_login_default,
+};
 pub use types::*;
 pub use wit_client::{
     DistributorApiBindings, GeneratedDistributorApiBindings, WitDistributorClient,

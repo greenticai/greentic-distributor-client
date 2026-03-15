@@ -10,6 +10,12 @@ pub struct StoreCredentials {
     pub token: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreAuth {
+    auth_path: PathBuf,
+    state_path: PathBuf,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct StoreAuthState {
     logins: Vec<StoreCredentials>,
@@ -40,6 +46,49 @@ pub fn default_store_auth_path() -> PathBuf {
 
 pub fn default_store_state_path() -> PathBuf {
     default_store_auth_path()
+}
+
+impl Default for StoreAuth {
+    fn default() -> Self {
+        Self::new(default_store_auth_path(), default_store_state_path())
+    }
+}
+
+impl StoreAuth {
+    pub fn new(auth_path: impl Into<PathBuf>, state_path: impl Into<PathBuf>) -> Self {
+        Self {
+            auth_path: auth_path.into(),
+            state_path: state_path.into(),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::default()
+    }
+
+    pub fn auth_path(&self) -> &Path {
+        &self.auth_path
+    }
+
+    pub fn state_path(&self) -> &Path {
+        &self.state_path
+    }
+
+    pub async fn save_login(&self, tenant: &str, token: &str) -> Result<(), StoreAuthError> {
+        save_login(&self.auth_path, &self.state_path, tenant, token).await
+    }
+
+    pub async fn load_login(&self, tenant: &str) -> Result<StoreCredentials, StoreAuthError> {
+        load_login(&self.auth_path, &self.state_path, tenant).await
+    }
+}
+
+pub async fn save_login_default(tenant: &str, token: &str) -> Result<(), StoreAuthError> {
+    StoreAuth::default().save_login(tenant, token).await
+}
+
+pub async fn load_login_default(tenant: &str) -> Result<StoreCredentials, StoreAuthError> {
+    StoreAuth::default().load_login(tenant).await
 }
 
 fn default_store_auth_dir() -> PathBuf {
@@ -174,5 +223,21 @@ mod tests {
         assert_eq!(loaded.tenant, "tenant-a");
         assert_eq!(loaded.username, "tenant-a");
         assert_eq!(loaded.token, "secret-token");
+    }
+
+    #[tokio::test]
+    async fn store_auth_wrapper_round_trips_login_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let auth = StoreAuth::new(
+            temp.path().join("store-auth.json"),
+            temp.path().join("store-auth.json"),
+        );
+
+        auth.save_login("tenant-b", "other-secret").await.unwrap();
+
+        let loaded = auth.load_login("tenant-b").await.unwrap();
+        assert_eq!(loaded.tenant, "tenant-b");
+        assert_eq!(loaded.username, "tenant-b");
+        assert_eq!(loaded.token, "other-secret");
     }
 }
