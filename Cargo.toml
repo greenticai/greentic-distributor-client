@@ -1,5 +1,5 @@
 [workspace.package]
-version = "0.4.32"
+version = "0.4.33"
 edition = "2024"
 
 [package]
@@ -43,11 +43,13 @@ anyhow = "1"
 greentic-types = { version = ">=0.4.52", features = ["schema"] }
 greentic-interfaces-guest = {  version = "0.4", features = ["distributor-api", "distributor-api-imports"] }
 greentic-config-types = "0.4"
+greentic-secrets-lib = { version = "0.4", features = ["providers-dev"] }
 semver = "1"
 oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"], optional = true }
 sha2 = { version = "0.10", optional = true }
 dirs-next = { version = "2", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
+rpassword = "7"
 [dev-dependencies]
 httpmock = "0.8"
 tempfile = { workspace = true }

@@ -15,13 +15,25 @@ pub mod oci_components;
 pub mod oci_packs;
 #[cfg(feature = "runner-api")]
 pub mod runner_api;
+pub mod store_auth;
 mod wit_client;
 
 pub use config::DistributorClientConfig;
 #[cfg(feature = "dist-client")]
+#[allow(deprecated)]
 pub use dist::{
-    DistClient, DistOptions, InjectedResolution, LockHint, ResolveRefInjector, ResolveRefRequest,
-    ResolvedArtifact,
+    AccessMode, AdvisorySet, ArtifactDescriptor, ArtifactOpenOutput, ArtifactOpenRequest,
+    ArtifactOpener, ArtifactSource, ArtifactSourceKind, ArtifactType, BundleLifecycleState,
+    BundleManifestSummary, BundleOpenMode, BundleOpenOutput, BundleOpenRequest, BundleOpener,
+    BundleRecord, CacheEntry, CacheEntryState, CachePolicy, DistClient, DistOptions,
+    InjectedResolution, IntegrationError, IntegrationErrorCode, IntegrityState, LockHint,
+    PreliminaryDecision, ReleaseTrainDescriptor, ResolvePolicy, ResolveRefInjector,
+    ResolveRefRequest, ResolvedArtifact, ResolvedVia, RetentionDecision, RetentionDisposition,
+    RetentionEnvironment, RetentionInput, RetentionOutcome, RetentionReport, RollbackAuditFields,
+    RollbackBundleInput, RollbackBundleResult, SourceSnapshot, StageAuditFields, StageBundleInput,
+    StageBundleResult, TransportHints, VerificationCheck, VerificationEnvironment,
+    VerificationOutcome, VerificationPolicy, VerificationReport, WarmAuditFields, WarmBundleInput,
+    WarmBundleResult,
 };
 pub use error::DistributorError;
 #[cfg(feature = "http-runtime")]
@@ -29,7 +41,7 @@ pub use http::HttpDistributorClient;
 #[cfg(feature = "oci-components")]
 pub use oci_components::{
     ComponentResolveOptions, ComponentsExtension, ComponentsMode, OciComponentError,
-    OciComponentResolver, ResolvedComponent,
+    OciComponentResolver, ResolvedComponent, ResolvedComponentDescriptor,
 };
 #[cfg(feature = "pack-fetch")]
 pub use oci_packs::{OciPackError, OciPackFetcher, PackFetchOptions, ResolvedPack};

@@ -1,8 +1,17 @@
 #![cfg(feature = "dist-client")]
+#![allow(deprecated)]
 
 use async_trait::async_trait;
 use greentic_distributor_client::dist::{
-    DistClient, DistOptions, InjectedResolution, ResolveRefInjector,
+    AccessMode, AdvisorySet, ArtifactSource, ArtifactSourceKind, BundleLifecycleState, CachePolicy,
+    DistClient, DistOptions, InjectedResolution, ResolvePolicy, ResolveRefInjector,
+    RetentionDecision, RetentionDisposition, RetentionEnvironment, RetentionInput,
+    RollbackBundleInput, StageBundleInput, VerificationEnvironment, VerificationPolicy,
+    WarmBundleInput,
+};
+use greentic_distributor_client::{
+    ArtifactOpenOutput, ArtifactOpenRequest, ArtifactOpener, BundleManifestSummary, BundleOpenMode,
+    CacheEntry, CacheEntryState, IntegrationError, IntegrationErrorCode, ResolvedArtifact,
 };
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -24,9 +33,22 @@ fn options(dir: &TempDir) -> DistOptions {
         cache_max_bytes: 3 * 1024 * 1024 * 1024,
         repo_registry_base: None,
         store_registry_base: None,
+        store_auth_path: dir.path().join("store-auth.json"),
+        store_state_path: dir.path().join("store-auth.json"),
         #[cfg(feature = "fixture-resolver")]
         fixture_dir: None,
     }
+}
+
+fn write_cache_entry(entry: &CacheEntry) {
+    let entry_path = entry.local_path.parent().unwrap().join("entry.json");
+    fs::write(entry_path, serde_json::to_vec_pretty(entry).unwrap()).unwrap();
+}
+
+fn bundle_record_path(dir: &TempDir, bundle_id: &str) -> std::path::PathBuf {
+    dir.path()
+        .join("bundles")
+        .join(format!("{}.json", bundle_id.replace(':', "__")))
 }
 
 #[tokio::test]
@@ -151,6 +173,34 @@ async fn respects_canonical_lockfile_with_schema_version() {
 }
 
 #[tokio::test]
+async fn pr01_lockfile_can_reopen_cached_digest_without_original_ref() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("hello.wasm");
+    fs::write(&file, b"hello").unwrap();
+    let digest = digest_for(b"hello");
+
+    let client = DistClient::new(options(&temp));
+    let _ = client.ensure_cached(file.to_str().unwrap()).await.unwrap();
+
+    let lock_path = temp.path().join("digest-only.lock.json");
+    let lock_contents = serde_json::json!({
+        "schema_version": 1,
+        "components": [
+            {
+                "name": "hello",
+                "digest": digest
+            }
+        ]
+    });
+    fs::write(&lock_path, serde_json::to_vec(&lock_contents).unwrap()).unwrap();
+
+    let resolved = client.pull_lock(&lock_path).await.unwrap();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].descriptor.digest, digest);
+    assert_eq!(resolved[0].wasm_bytes().unwrap(), b"hello");
+}
+
+#[tokio::test]
 async fn offline_mode_blocks_http_fetch() {
     let temp = tempfile::tempdir().unwrap();
     let mut opts = options(&temp);
@@ -211,6 +261,1385 @@ async fn file_resolution_exposes_describe_sidecar_ref_when_available() {
         resolved.describe_artifact_ref.as_deref(),
         Some(describe_path.to_str().unwrap())
     );
+}
+
+#[tokio::test]
+async fn pr01_resolve_returns_canonical_file_descriptor() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("component.wasm");
+    fs::write(&file_path, b"descriptor").unwrap();
+
+    let client = DistClient::new(options(&temp));
+    let source = ArtifactSource {
+        raw_ref: file_path.to_string_lossy().to_string(),
+        kind: ArtifactSourceKind::File,
+        transport_hints: Default::default(),
+        dev_mode: true,
+    };
+
+    let descriptor = client.resolve(source, ResolvePolicy).await.unwrap();
+    assert_eq!(descriptor.source_kind, ArtifactSourceKind::File);
+    assert_eq!(descriptor.digest, digest_for(b"descriptor"));
+    assert!(descriptor.canonical_ref.contains("@sha256:"));
+}
+
+#[tokio::test]
+async fn pr01_fetch_persists_entry_and_open_cached_reuses_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("component.wasm");
+    fs::write(&file_path, b"open-cached").unwrap();
+
+    let client = DistClient::new(options(&temp));
+    let source = ArtifactSource {
+        raw_ref: file_path.to_string_lossy().to_string(),
+        kind: ArtifactSourceKind::File,
+        transport_hints: Default::default(),
+        dev_mode: true,
+    };
+
+    let descriptor = client.resolve(source, ResolvePolicy).await.unwrap();
+    let fetched = client.fetch(&descriptor, CachePolicy).await.unwrap();
+    let entry = client.stat_cache(&descriptor.digest).unwrap();
+    let reopened = client.open_cached(&descriptor.digest).unwrap();
+
+    assert_eq!(entry.digest, descriptor.digest);
+    assert_eq!(entry.canonical_ref, descriptor.canonical_ref);
+    assert_eq!(fetched.descriptor.digest, reopened.descriptor.digest);
+    assert_eq!(reopened.wasm_bytes().unwrap(), b"open-cached");
+}
+
+#[tokio::test]
+async fn pr01_repo_placeholder_requires_mapping_when_unconfigured() {
+    let temp = tempfile::tempdir().unwrap();
+    let client = DistClient::new(options(&temp));
+    let source = ArtifactSource {
+        raw_ref: "repo://future-placeholder".to_string(),
+        kind: ArtifactSourceKind::Repo,
+        transport_hints: Default::default(),
+        dev_mode: false,
+    };
+
+    let err = client.resolve(source, ResolvePolicy).await.unwrap_err();
+    assert!(
+        format!("{err}").contains("resolution unavailable"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn pr02_deny_digest_refuses_descriptor() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("component.wasm");
+    fs::write(&file_path, b"deny-me").unwrap();
+
+    let client = DistClient::new(options(&temp));
+    let source = ArtifactSource {
+        raw_ref: file_path.to_string_lossy().to_string(),
+        kind: ArtifactSourceKind::File,
+        transport_hints: Default::default(),
+        dev_mode: true,
+    };
+    let descriptor = client.resolve(source, ResolvePolicy).await.unwrap();
+    let policy = VerificationPolicy {
+        deny_digests: vec![descriptor.digest.clone()],
+        ..VerificationPolicy::default()
+    };
+
+    let decision = client.apply_policy(&descriptor, None, &policy);
+    assert!(!decision.passed);
+    assert!(decision.errors.iter().any(|err| err.contains("denied")));
+}
+
+#[tokio::test]
+async fn pr02_missing_issuer_yields_warning() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("component.wasm");
+    fs::write(&file_path, b"issuerless").unwrap();
+
+    let client = DistClient::new(options(&temp));
+    let source = ArtifactSource {
+        raw_ref: file_path.to_string_lossy().to_string(),
+        kind: ArtifactSourceKind::File,
+        transport_hints: Default::default(),
+        dev_mode: true,
+    };
+    let descriptor = client.resolve(source, ResolvePolicy).await.unwrap();
+
+    let decision = client.apply_policy(&descriptor, None, &VerificationPolicy::default());
+    let issuer_check = decision
+        .checks
+        .iter()
+        .find(|check| check.name == "issuer_allowed")
+        .unwrap();
+    assert!(issuer_check.detail.contains("missing"));
+}
+
+#[tokio::test]
+async fn pr02_operator_version_mismatch_warns_in_dev() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("component.wasm");
+    fs::write(&file_path, b"version-check").unwrap();
+
+    let client = DistClient::new(options(&temp));
+    let source = ArtifactSource {
+        raw_ref: file_path.to_string_lossy().to_string(),
+        kind: ArtifactSourceKind::File,
+        transport_hints: Default::default(),
+        dev_mode: true,
+    };
+    let mut descriptor = client.resolve(source, ResolvePolicy).await.unwrap();
+    descriptor.annotations.insert(
+        "operator_version".to_string(),
+        serde_json::Value::String("1.0.0".to_string()),
+    );
+
+    let policy = VerificationPolicy {
+        minimum_operator_version: Some("2.0.0".to_string()),
+        environment: VerificationEnvironment::Dev,
+        ..VerificationPolicy::default()
+    };
+
+    let decision = client.apply_policy(&descriptor, None, &policy);
+    assert!(decision.passed);
+    assert!(
+        decision
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("does not satisfy"))
+    );
+}
+
+#[tokio::test]
+async fn pr02_verify_artifact_updates_cache_verification_metadata() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("component.wasm");
+    fs::write(&file_path, b"verified").unwrap();
+
+    let client = DistClient::new(options(&temp));
+    let source = ArtifactSource {
+        raw_ref: file_path.to_string_lossy().to_string(),
+        kind: ArtifactSourceKind::File,
+        transport_hints: Default::default(),
+        dev_mode: true,
+    };
+    let mut descriptor = client.resolve(source, ResolvePolicy).await.unwrap();
+    descriptor.sbom_refs.push("sbom://present".to_string());
+    descriptor.signature_refs.push("sig://present".to_string());
+    let fetched = client.fetch(&descriptor, CachePolicy).await.unwrap();
+
+    let advisory = AdvisorySet {
+        version: "7".to_string(),
+        issued_at: 123,
+        source: "test".to_string(),
+        deny_digests: Vec::new(),
+        deny_issuers: Vec::new(),
+        minimum_operator_version: None,
+        release_train: None,
+        expires_at: None,
+        next_refresh_hint: None,
+    };
+    let report = client
+        .verify_artifact(&fetched, Some(&advisory), &VerificationPolicy::default())
+        .unwrap();
+    let entry = client.stat_cache(&fetched.descriptor.digest).unwrap();
+
+    assert!(report.passed);
+    assert_eq!(entry.advisory_epoch, Some(7));
+    assert!(entry.last_verified_at.is_some());
+    assert!(entry.signature_summary.is_some());
+}
+
+#[tokio::test]
+async fn pr02_prod_rejects_unsigned_artifact_while_dev_warns() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("unsigned.wasm");
+    fs::write(&file_path, b"unsigned").unwrap();
+
+    let client = DistClient::new(options(&temp));
+    let source = ArtifactSource {
+        raw_ref: file_path.to_string_lossy().to_string(),
+        kind: ArtifactSourceKind::File,
+        transport_hints: Default::default(),
+        dev_mode: true,
+    };
+    let descriptor = client.resolve(source, ResolvePolicy).await.unwrap();
+    let fetched = client.fetch(&descriptor, CachePolicy).await.unwrap();
+
+    let dev_policy = VerificationPolicy {
+        require_signature: true,
+        environment: VerificationEnvironment::Dev,
+        ..VerificationPolicy::default()
+    };
+    let dev_report = client.verify_artifact(&fetched, None, &dev_policy).unwrap();
+    let dev_signature_present = dev_report
+        .checks
+        .iter()
+        .find(|check| check.name == "signature_present")
+        .unwrap();
+    assert!(dev_report.passed);
+    assert_eq!(
+        dev_signature_present.outcome,
+        greentic_distributor_client::VerificationOutcome::Warning
+    );
+
+    let prod_policy = VerificationPolicy {
+        require_signature: true,
+        environment: VerificationEnvironment::Prod,
+        ..VerificationPolicy::default()
+    };
+    let prod_report = client
+        .verify_artifact(&fetched, None, &prod_policy)
+        .unwrap();
+    let prod_signature_verified = prod_report
+        .checks
+        .iter()
+        .find(|check| check.name == "signature_verified")
+        .unwrap();
+    assert!(!prod_report.passed);
+    assert_eq!(
+        prod_signature_verified.outcome,
+        greentic_distributor_client::VerificationOutcome::Failed
+    );
+}
+
+#[tokio::test]
+async fn pr02_cached_artifact_can_be_reverified_under_newer_advisory_without_redownload() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("advisory-shift.wasm");
+    fs::write(&file_path, b"advisory-shift").unwrap();
+
+    let client = DistClient::new(options(&temp));
+    let source = ArtifactSource {
+        raw_ref: file_path.to_string_lossy().to_string(),
+        kind: ArtifactSourceKind::File,
+        transport_hints: Default::default(),
+        dev_mode: true,
+    };
+    let descriptor = client.resolve(source, ResolvePolicy).await.unwrap();
+    client.fetch(&descriptor, CachePolicy).await.unwrap();
+    let initial_entry = client.stat_cache(&descriptor.digest).unwrap();
+    let reopened = client.open_cached(&descriptor.digest).unwrap();
+    let reopened_entry = client.stat_cache(&descriptor.digest).unwrap();
+
+    assert_eq!(reopened.descriptor.digest, descriptor.digest);
+    assert_eq!(initial_entry.fetched_at, reopened_entry.fetched_at);
+
+    let advisory_v1 = AdvisorySet {
+        version: "1".to_string(),
+        issued_at: 100,
+        source: "test".to_string(),
+        deny_digests: Vec::new(),
+        deny_issuers: Vec::new(),
+        minimum_operator_version: None,
+        release_train: None,
+        expires_at: None,
+        next_refresh_hint: None,
+    };
+    let report_v1 = client
+        .verify_artifact(
+            &reopened,
+            Some(&advisory_v1),
+            &VerificationPolicy::default(),
+        )
+        .unwrap();
+    let entry_after_v1 = client.stat_cache(&descriptor.digest).unwrap();
+
+    assert!(report_v1.passed);
+    assert_eq!(entry_after_v1.advisory_epoch, Some(1));
+
+    let advisory_v2 = AdvisorySet {
+        version: "2".to_string(),
+        issued_at: 200,
+        source: "test".to_string(),
+        deny_digests: vec![descriptor.digest.clone()],
+        deny_issuers: Vec::new(),
+        minimum_operator_version: None,
+        release_train: None,
+        expires_at: None,
+        next_refresh_hint: None,
+    };
+    let report_v2 = client
+        .verify_artifact(
+            &reopened,
+            Some(&advisory_v2),
+            &VerificationPolicy::default(),
+        )
+        .unwrap();
+    let entry_after_v2 = client.stat_cache(&descriptor.digest).unwrap();
+
+    assert!(!report_v2.passed);
+    assert!(
+        report_v2
+            .errors
+            .iter()
+            .any(|error| error.contains("denied"))
+    );
+    assert_eq!(entry_after_v2.advisory_epoch, Some(2));
+    assert_eq!(entry_after_v2.fetched_at, initial_entry.fetched_at);
+}
+
+#[tokio::test]
+async fn pr03_repeated_stage_returns_stable_bundle_id_and_cache_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("bundle.wasm");
+    fs::write(&file_path, b"stage-me").unwrap();
+
+    let client = DistClient::new(options(&temp));
+    let input = StageBundleInput {
+        bundle_ref: file_path.to_string_lossy().to_string(),
+        requested_access_mode: AccessMode::Userspace,
+        verification_policy_ref: "default".to_string(),
+        cache_policy_ref: "default".to_string(),
+        tenant: Some("tenant-a".to_string()),
+        team: Some("team-a".to_string()),
+    };
+
+    let first = client
+        .stage_bundle(&input, None, &VerificationPolicy::default(), CachePolicy)
+        .await
+        .unwrap();
+    let second = client
+        .stage_bundle(&input, None, &VerificationPolicy::default(), CachePolicy)
+        .await
+        .unwrap();
+
+    assert_eq!(first.bundle_id, second.bundle_id);
+    assert_eq!(first.cache_entry.cache_key, second.cache_entry.cache_key);
+    assert_eq!(first.canonical_ref, second.canonical_ref);
+}
+
+#[tokio::test]
+async fn pr03_warm_reopens_cached_artifact_after_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("warm.wasm");
+    fs::write(&file_path, b"warm-me").unwrap();
+
+    let input = StageBundleInput {
+        bundle_ref: file_path.to_string_lossy().to_string(),
+        requested_access_mode: AccessMode::Userspace,
+        verification_policy_ref: "default".to_string(),
+        cache_policy_ref: "default".to_string(),
+        tenant: None,
+        team: None,
+    };
+    let stage_client = DistClient::new(options(&temp));
+    let stage = stage_client
+        .stage_bundle(&input, None, &VerificationPolicy::default(), CachePolicy)
+        .await
+        .unwrap();
+
+    let mut restarted_opts = options(&temp);
+    restarted_opts.offline = true;
+    let restarted_client = DistClient::new(restarted_opts);
+    let warm = restarted_client
+        .warm_bundle(
+            &WarmBundleInput {
+                bundle_id: stage.bundle_id.clone(),
+                cache_key: stage.cache_entry.cache_key.clone(),
+                smoke_test: true,
+                dry_run: false,
+                expected_operator_version: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+        )
+        .unwrap();
+
+    assert_eq!(warm.bundle_id, stage.bundle_id);
+    assert!(warm.errors.is_empty());
+    assert_eq!(
+        warm.bundle_manifest_summary.component_id,
+        stage.resolved_artifact.component_id
+    );
+}
+
+#[tokio::test]
+async fn pr03_rollback_reopens_from_cache_without_network_or_reresolution() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("rollback.wasm");
+    fs::write(&file_path, b"rollback-me").unwrap();
+
+    let stage_client = DistClient::new(options(&temp));
+    let stage = stage_client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: file_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+
+    let mut offline_opts = options(&temp);
+    offline_opts.offline = true;
+    let offline_client = DistClient::new(offline_opts);
+    let rollback = offline_client
+        .rollback_bundle(
+            &RollbackBundleInput {
+                target_bundle_id: stage.bundle_id.clone(),
+                expected_cache_key: Some(stage.cache_entry.cache_key.clone()),
+            },
+            None,
+            &VerificationPolicy::default(),
+        )
+        .unwrap();
+
+    assert!(rollback.reopened_from_cache);
+    assert_eq!(rollback.bundle_id, stage.bundle_id);
+    assert_eq!(rollback.cache_entry.cache_key, stage.cache_entry.cache_key);
+    assert!(rollback.verification_report.errors.is_empty());
+}
+
+#[tokio::test]
+async fn pr04_bundle_record_persists_stage_identity_for_offline_rollback() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("indexed-rollback.wasm");
+    fs::write(&file_path, b"indexed-rollback").unwrap();
+
+    let stage_client = DistClient::new(options(&temp));
+    let stage = stage_client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: file_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+
+    let record = stage_client.stat_bundle(&stage.bundle_id).unwrap();
+    assert_eq!(record.cache_key, stage.cache_entry.cache_key);
+    assert_eq!(record.canonical_ref, stage.canonical_ref);
+    assert_eq!(record.lifecycle_state, BundleLifecycleState::Staged);
+    assert_eq!(stage_client.list_bundles().unwrap(), vec![record.clone()]);
+
+    let mut offline_opts = options(&temp);
+    offline_opts.offline = true;
+    let offline_client = DistClient::new(offline_opts);
+    let rollback = offline_client
+        .rollback_bundle(
+            &RollbackBundleInput {
+                target_bundle_id: stage.bundle_id.clone(),
+                expected_cache_key: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+        )
+        .unwrap();
+
+    assert_eq!(rollback.bundle_id, stage.bundle_id);
+    assert_eq!(rollback.cache_entry.cache_key, stage.cache_entry.cache_key);
+}
+
+struct MountBundleOpener;
+
+impl ArtifactOpener for MountBundleOpener {
+    fn open(
+        &self,
+        artifact: &ResolvedArtifact,
+        _request: &ArtifactOpenRequest,
+    ) -> Result<ArtifactOpenOutput, IntegrationError> {
+        Ok(ArtifactOpenOutput {
+            bundle_manifest_summary: BundleManifestSummary {
+                component_id: format!("mounted:{}", artifact.component_id),
+                abi_version: artifact.abi_version.clone(),
+                describe_artifact_ref: artifact.describe_artifact_ref.clone(),
+                artifact_type: artifact.descriptor.artifact_type.clone(),
+                media_type: artifact.descriptor.media_type.clone(),
+                size_bytes: artifact.descriptor.size_bytes,
+            },
+            bundle_open_mode: BundleOpenMode::Mount,
+            warnings: vec!["custom opener used".to_string()],
+        })
+    }
+}
+
+struct FailingBundleOpener;
+
+impl ArtifactOpener for FailingBundleOpener {
+    fn open(
+        &self,
+        _artifact: &ResolvedArtifact,
+        request: &ArtifactOpenRequest,
+    ) -> Result<ArtifactOpenOutput, IntegrationError> {
+        Err(IntegrationError {
+            code: IntegrationErrorCode::BundleOpenFailed,
+            summary: format!("failed to open {}", request.bundle_id),
+            retryable: false,
+            details: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn pr03_warm_uses_custom_bundle_opener() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("mountable.wasm");
+    fs::write(&file_path, b"mount-me").unwrap();
+
+    let stage_client = DistClient::new(options(&temp));
+    let stage = stage_client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: file_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Mount,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+
+    let warm_client = DistClient::with_artifact_opener(options(&temp), Arc::new(MountBundleOpener));
+    let warm = warm_client
+        .warm_bundle(
+            &WarmBundleInput {
+                bundle_id: stage.bundle_id.clone(),
+                cache_key: stage.cache_entry.cache_key.clone(),
+                smoke_test: false,
+                dry_run: false,
+                expected_operator_version: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+        )
+        .unwrap();
+
+    assert_eq!(warm.bundle_open_mode, BundleOpenMode::Mount);
+    assert!(
+        warm.warnings
+            .iter()
+            .any(|warning| warning.contains("custom opener"))
+    );
+    assert!(
+        warm.bundle_manifest_summary
+            .component_id
+            .starts_with("mounted:")
+    );
+}
+
+#[tokio::test]
+async fn pr03_warm_maps_bundle_opener_failures() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("broken-open.wasm");
+    fs::write(&file_path, b"broken-open").unwrap();
+
+    let stage_client = DistClient::new(options(&temp));
+    let stage = stage_client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: file_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+
+    let warm_client =
+        DistClient::with_artifact_opener(options(&temp), Arc::new(FailingBundleOpener));
+    let err = warm_client
+        .warm_bundle(
+            &WarmBundleInput {
+                bundle_id: stage.bundle_id.clone(),
+                cache_key: stage.cache_entry.cache_key.clone(),
+                smoke_test: false,
+                dry_run: false,
+                expected_operator_version: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+        )
+        .unwrap_err();
+
+    assert_eq!(err.code, IntegrationErrorCode::BundleOpenFailed);
+    assert!(err.summary.contains(&stage.bundle_id));
+}
+
+#[tokio::test]
+async fn pr03_warm_rejects_invalid_bundle_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("invalid-bundle-id.wasm");
+    fs::write(&file_path, b"invalid-bundle-id").unwrap();
+
+    let stage_client = DistClient::new(options(&temp));
+    let stage = stage_client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: file_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+
+    let err = stage_client
+        .warm_bundle(
+            &WarmBundleInput {
+                bundle_id: "bundle:sha256:deadbeef".to_string(),
+                cache_key: stage.cache_entry.cache_key.clone(),
+                smoke_test: false,
+                dry_run: false,
+                expected_operator_version: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+        )
+        .unwrap_err();
+
+    assert_eq!(err.code, IntegrationErrorCode::InvalidReference);
+    assert!(err.summary.contains("does not match cache key"));
+}
+
+#[tokio::test]
+async fn pr03_warm_distinguishes_corrupt_cached_blob_from_cache_miss() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("corrupt-cache.wasm");
+    fs::write(&file_path, b"corrupt-cache").unwrap();
+
+    let stage_client = DistClient::new(options(&temp));
+    let stage = stage_client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: file_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+
+    fs::remove_file(stage.cache_entry.local_path.clone()).unwrap();
+
+    let err = stage_client
+        .warm_bundle(
+            &WarmBundleInput {
+                bundle_id: stage.bundle_id.clone(),
+                cache_key: stage.cache_entry.cache_key.clone(),
+                smoke_test: false,
+                dry_run: false,
+                expected_operator_version: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+        )
+        .unwrap_err();
+
+    assert_eq!(err.code, IntegrationErrorCode::CacheCorrupt);
+    assert!(err.summary.contains("cached blob is missing"));
+}
+
+#[tokio::test]
+async fn pr03_warm_uses_expected_operator_version_for_prod_gate() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("operator-gate.wasm");
+    fs::write(&file_path, b"operator-gate").unwrap();
+
+    let stage_client = DistClient::new(options(&temp));
+    let stage = stage_client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: file_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+
+    let err = stage_client
+        .warm_bundle(
+            &WarmBundleInput {
+                bundle_id: stage.bundle_id.clone(),
+                cache_key: stage.cache_entry.cache_key.clone(),
+                smoke_test: false,
+                dry_run: false,
+                expected_operator_version: Some("1.0.0".to_string()),
+            },
+            None,
+            &VerificationPolicy {
+                minimum_operator_version: Some("2.0.0".to_string()),
+                environment: VerificationEnvironment::Prod,
+                ..VerificationPolicy::default()
+            },
+        )
+        .unwrap_err();
+
+    assert_eq!(err.code, IntegrationErrorCode::VerificationFailed);
+    assert!(err.summary.contains("does not satisfy minimum"));
+    let failed_checks = err
+        .details
+        .as_ref()
+        .and_then(|details| details.get("failed_checks"))
+        .and_then(|value| value.as_array())
+        .unwrap();
+    assert_eq!(failed_checks.len(), 1);
+    assert_eq!(
+        failed_checks[0]
+            .get("name")
+            .and_then(|value| value.as_str()),
+        Some("operator_version_compatible")
+    );
+}
+
+#[tokio::test]
+async fn pr03_warm_missing_cache_entry_is_cache_miss() {
+    let temp = tempfile::tempdir().unwrap();
+    let client = DistClient::new(options(&temp));
+
+    let err = client
+        .warm_bundle(
+            &WarmBundleInput {
+                bundle_id:
+                    "bundle:sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                cache_key:
+                    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                smoke_test: false,
+                dry_run: false,
+                expected_operator_version: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+        )
+        .unwrap_err();
+
+    assert_eq!(err.code, IntegrationErrorCode::CacheMiss);
+    assert!(err.summary.contains("was not found"));
+}
+
+#[tokio::test]
+async fn pr03_rollback_rejects_invalid_bundle_id() {
+    let temp = tempfile::tempdir().unwrap();
+    let client = DistClient::new(options(&temp));
+
+    let err = client
+        .rollback_bundle(
+            &RollbackBundleInput {
+                target_bundle_id: "not-a-bundle-id".to_string(),
+                expected_cache_key: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+        )
+        .unwrap_err();
+
+    assert_eq!(err.code, IntegrationErrorCode::InvalidReference);
+    assert!(err.summary.contains("invalid bundle id"));
+}
+
+#[tokio::test]
+async fn pr03_rollback_missing_cache_entry_is_cache_miss() {
+    let temp = tempfile::tempdir().unwrap();
+    let client = DistClient::new(options(&temp));
+
+    let digest = "sha256:fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    let err = client
+        .rollback_bundle(
+            &RollbackBundleInput {
+                target_bundle_id: format!("bundle:{digest}"),
+                expected_cache_key: Some(digest.to_string()),
+            },
+            None,
+            &VerificationPolicy::default(),
+        )
+        .unwrap_err();
+
+    assert_eq!(err.code, IntegrationErrorCode::CacheMiss);
+    assert!(err.summary.contains("was not found"));
+}
+
+#[tokio::test]
+async fn pr04_retention_protects_active_and_session_bundles() {
+    let temp = tempfile::tempdir().unwrap();
+    let client = DistClient::new(options(&temp));
+
+    let first_path = temp.path().join("active.wasm");
+    let second_path = temp.path().join("session.wasm");
+    fs::write(&first_path, b"active").unwrap();
+    fs::write(&second_path, b"session").unwrap();
+
+    let active = client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: first_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+    let session = client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: second_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+
+    let outcome = client
+        .evaluate_retention(&RetentionInput {
+            entries: client.list_cache_entries(),
+            active_bundle_ids: vec![active.bundle_id.clone()],
+            staged_bundle_ids: Vec::new(),
+            warming_bundle_ids: Vec::new(),
+            ready_bundle_ids: Vec::new(),
+            draining_bundle_ids: Vec::new(),
+            session_referenced_bundle_ids: vec![session.bundle_id.clone()],
+            max_cache_bytes: 1,
+            max_entry_age: Some(0),
+            minimum_rollback_depth: 0,
+            environment: RetentionEnvironment::Prod,
+        })
+        .unwrap();
+
+    assert_eq!(outcome.report.protected, 2);
+    assert!(outcome.decisions.iter().any(|decision| {
+        decision.bundle_id == active.bundle_id
+            && matches!(decision.decision, RetentionDisposition::Protect)
+            && decision.reason_code == "active_bundle"
+    }));
+    assert!(outcome.decisions.iter().any(|decision| {
+        decision.bundle_id == session.bundle_id
+            && matches!(decision.decision, RetentionDisposition::Protect)
+            && decision.reason_code == "session_reference"
+    }));
+}
+
+#[tokio::test]
+async fn pr04_retention_respects_rollback_depth() {
+    let temp = tempfile::tempdir().unwrap();
+    let client = DistClient::new(options(&temp));
+
+    let mut staged = Vec::new();
+    for (name, bytes) in [
+        ("a.wasm", b"a".as_slice()),
+        ("b.wasm", b"b".as_slice()),
+        ("c.wasm", b"c".as_slice()),
+    ] {
+        let path = temp.path().join(name);
+        fs::write(&path, bytes).unwrap();
+        staged.push(
+            client
+                .stage_bundle(
+                    &StageBundleInput {
+                        bundle_ref: path.to_string_lossy().to_string(),
+                        requested_access_mode: AccessMode::Userspace,
+                        verification_policy_ref: "default".to_string(),
+                        cache_policy_ref: "default".to_string(),
+                        tenant: None,
+                        team: None,
+                    },
+                    None,
+                    &VerificationPolicy::default(),
+                    CachePolicy,
+                )
+                .await
+                .unwrap(),
+        );
+    }
+
+    for (index, staged_item) in staged.iter().enumerate() {
+        let mut entry = client
+            .stat_cache(&staged_item.cache_entry.cache_key)
+            .unwrap();
+        entry.fetched_at = (index as u64) + 1;
+        write_cache_entry(&entry);
+    }
+
+    let outcome = client
+        .evaluate_retention(&RetentionInput {
+            entries: client.list_cache_entries(),
+            active_bundle_ids: vec![staged[2].bundle_id.clone()],
+            staged_bundle_ids: Vec::new(),
+            warming_bundle_ids: Vec::new(),
+            ready_bundle_ids: Vec::new(),
+            draining_bundle_ids: Vec::new(),
+            session_referenced_bundle_ids: Vec::new(),
+            max_cache_bytes: 1,
+            max_entry_age: Some(0),
+            minimum_rollback_depth: 1,
+            environment: RetentionEnvironment::Prod,
+        })
+        .unwrap();
+
+    assert!(outcome.decisions.iter().any(|decision| {
+        decision.bundle_id == staged[1].bundle_id
+            && matches!(decision.decision, RetentionDisposition::Protect)
+            && decision.reason_code == "rollback_depth"
+    }));
+}
+
+#[tokio::test]
+async fn pr04_retention_prefers_safe_corrupt_eviction() {
+    let temp = tempfile::tempdir().unwrap();
+    let client = DistClient::new(options(&temp));
+
+    let first_path = temp.path().join("corrupt.wasm");
+    let second_path = temp.path().join("healthy.wasm");
+    fs::write(&first_path, b"corrupt").unwrap();
+    fs::write(&second_path, b"healthy").unwrap();
+
+    let corrupt = client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: first_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+    let healthy = client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: second_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+
+    let mut corrupt_entry = client.stat_cache(&corrupt.cache_entry.cache_key).unwrap();
+    corrupt_entry.state = CacheEntryState::Corrupt;
+    corrupt_entry.last_accessed_at = 1;
+    write_cache_entry(&corrupt_entry);
+
+    let mut healthy_entry = client.stat_cache(&healthy.cache_entry.cache_key).unwrap();
+    healthy_entry.last_accessed_at = 1;
+    write_cache_entry(&healthy_entry);
+
+    let outcome = client
+        .evaluate_retention(&RetentionInput {
+            entries: client.list_cache_entries(),
+            active_bundle_ids: Vec::new(),
+            staged_bundle_ids: Vec::new(),
+            warming_bundle_ids: Vec::new(),
+            ready_bundle_ids: Vec::new(),
+            draining_bundle_ids: Vec::new(),
+            session_referenced_bundle_ids: Vec::new(),
+            max_cache_bytes: healthy_entry.size_bytes + 1,
+            max_entry_age: None,
+            minimum_rollback_depth: 0,
+            environment: RetentionEnvironment::Prod,
+        })
+        .unwrap();
+
+    assert!(outcome.decisions.iter().any(|decision| {
+        decision.bundle_id == corrupt.bundle_id
+            && matches!(decision.decision, RetentionDisposition::Evict)
+            && decision.reason_code == "corrupt_entry"
+    }));
+    assert!(outcome.decisions.iter().any(|decision| {
+        decision.bundle_id == healthy.bundle_id
+            && !matches!(decision.decision, RetentionDisposition::Evict)
+    }));
+}
+
+#[tokio::test]
+async fn pr04_retention_budget_tie_breaks_by_cache_key() {
+    let temp = tempfile::tempdir().unwrap();
+    let client = DistClient::new(options(&temp));
+
+    let first_path = temp.path().join("tie-a.wasm");
+    let second_path = temp.path().join("tie-b.wasm");
+    fs::write(&first_path, b"same-size-a").unwrap();
+    fs::write(&second_path, b"same-size-b").unwrap();
+
+    let first = client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: first_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+    let second = client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: second_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+
+    for cache_key in [&first.cache_entry.cache_key, &second.cache_entry.cache_key] {
+        let mut entry = client.stat_cache(cache_key).unwrap();
+        entry.last_accessed_at = 1;
+        write_cache_entry(&entry);
+    }
+
+    let entries = client.list_cache_entries();
+    let total = entries.iter().map(|entry| entry.size_bytes).sum::<u64>();
+    let outcome = client
+        .evaluate_retention(&RetentionInput {
+            entries,
+            active_bundle_ids: Vec::new(),
+            staged_bundle_ids: Vec::new(),
+            warming_bundle_ids: Vec::new(),
+            ready_bundle_ids: Vec::new(),
+            draining_bundle_ids: Vec::new(),
+            session_referenced_bundle_ids: Vec::new(),
+            max_cache_bytes: total.saturating_sub(first.cache_entry.size_bytes),
+            max_entry_age: None,
+            minimum_rollback_depth: 0,
+            environment: RetentionEnvironment::Prod,
+        })
+        .unwrap();
+
+    let evicted = outcome
+        .decisions
+        .iter()
+        .filter(|decision| matches!(decision.decision, RetentionDisposition::Evict))
+        .collect::<Vec<&RetentionDecision>>();
+    assert_eq!(evicted.len(), 1);
+    let expected = [
+        first.cache_entry.cache_key.clone(),
+        second.cache_entry.cache_key.clone(),
+    ]
+    .into_iter()
+    .min()
+    .unwrap();
+    assert_eq!(evicted[0].cache_key, expected);
+}
+
+#[tokio::test]
+async fn pr04_apply_retention_removes_bundle_record_for_evicted_entry() {
+    let temp = tempfile::tempdir().unwrap();
+    let client = DistClient::new(options(&temp));
+
+    let file_path = temp.path().join("evicted-record.wasm");
+    fs::write(&file_path, b"evicted-record").unwrap();
+    let staged = client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: file_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+    let mut entry = client.stat_cache(&staged.cache_entry.cache_key).unwrap();
+    entry.last_accessed_at = 1;
+    write_cache_entry(&entry);
+
+    let outcome = client
+        .apply_retention(&RetentionInput {
+            entries: client.list_cache_entries(),
+            active_bundle_ids: Vec::new(),
+            staged_bundle_ids: Vec::new(),
+            warming_bundle_ids: Vec::new(),
+            ready_bundle_ids: Vec::new(),
+            draining_bundle_ids: Vec::new(),
+            session_referenced_bundle_ids: Vec::new(),
+            max_cache_bytes: 0,
+            max_entry_age: Some(0),
+            minimum_rollback_depth: 0,
+            environment: RetentionEnvironment::Prod,
+        })
+        .unwrap();
+
+    assert!(outcome.decisions.iter().any(|decision| {
+        decision.bundle_id == staged.bundle_id
+            && matches!(decision.decision, RetentionDisposition::Evict)
+    }));
+    assert!(client.stat_bundle(&staged.bundle_id).is_err());
+}
+
+#[tokio::test]
+async fn pr04_automatic_cache_cap_preserves_staged_bundle_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut opts = options(&temp);
+    opts.cache_max_bytes = 1;
+    let client = DistClient::new(opts);
+
+    let first_path = temp.path().join("auto-protect-a.wasm");
+    let second_path = temp.path().join("auto-protect-b.wasm");
+    fs::write(&first_path, b"aaaa").unwrap();
+    fs::write(&second_path, b"bbbb").unwrap();
+
+    let first = client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: first_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+    let second = client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: second_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+
+    let cache_entries = client.list_cache_entries();
+    assert_eq!(cache_entries.len(), 2);
+    assert!(client.stat_bundle(&first.bundle_id).is_ok());
+    assert!(client.stat_bundle(&second.bundle_id).is_ok());
+}
+
+#[tokio::test]
+async fn pr04_inactive_bundle_state_allows_automatic_cap_eviction() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut opts = options(&temp);
+    opts.cache_max_bytes = 4;
+    let client = DistClient::new(opts);
+
+    let first_path = temp.path().join("inactive-a.wasm");
+    let second_path = temp.path().join("inactive-b.wasm");
+    fs::write(&first_path, b"aaaa").unwrap();
+    fs::write(&second_path, b"bbbb").unwrap();
+
+    let first = client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: first_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+    client
+        .set_bundle_state(&first.bundle_id, BundleLifecycleState::Inactive)
+        .unwrap();
+
+    let second = client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: second_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+
+    assert!(client.stat_bundle(&first.bundle_id).is_err());
+    assert!(client.stat_bundle(&second.bundle_id).is_ok());
+}
+
+#[tokio::test]
+async fn pr04_list_bundles_errors_on_corrupt_bundle_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let client = DistClient::new(options(&temp));
+
+    let file_path = temp.path().join("corrupt-record.wasm");
+    fs::write(&file_path, b"corrupt-record").unwrap();
+    let staged = client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: file_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+
+    fs::write(bundle_record_path(&temp, &staged.bundle_id), b"{not-json").unwrap();
+
+    let err = client.list_bundles().unwrap_err();
+    assert!(format!("{err}").contains("cache error"));
+}
+
+#[tokio::test]
+async fn pr04_evict_cache_removes_bundle_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let client = DistClient::new(options(&temp));
+
+    let file_path = temp.path().join("evict-record.wasm");
+    fs::write(&file_path, b"evict-record").unwrap();
+    let staged = client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: file_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+    let mut entry = client.stat_cache(&staged.cache_entry.cache_key).unwrap();
+    entry.last_accessed_at = 1;
+    write_cache_entry(&entry);
+
+    let report = client
+        .evict_cache(std::slice::from_ref(&staged.cache_entry.cache_key))
+        .unwrap();
+
+    assert_eq!(report.evicted, 1);
+    assert!(client.stat_bundle(&staged.bundle_id).is_err());
+}
+
+#[tokio::test]
+async fn pr04_gc_removes_orphaned_bundle_record() {
+    let temp = tempfile::tempdir().unwrap();
+    let client = DistClient::new(options(&temp));
+
+    let file_path = temp.path().join("orphan-record.wasm");
+    fs::write(&file_path, b"orphan-record").unwrap();
+    let staged = client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: file_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+
+    fs::remove_dir_all(staged.cache_entry.local_path.parent().unwrap()).unwrap();
+    let removed = client.gc().unwrap();
+
+    assert_eq!(removed, vec![staged.cache_entry.cache_key.clone()]);
+    assert!(client.stat_bundle(&staged.bundle_id).is_err());
 }
 
 #[tokio::test]

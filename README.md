@@ -111,8 +111,8 @@ cargo run --features dist-cli --bin greentic-dist -- resolve ghcr.io/greenticai/
 Commands:
 - `resolve <REF>`: print digest (use `--json` for structured output).
 - `pull <REF>`: ensure cached; prints path. Use `--lock <pack.lock>` to pull all components from a lockfile.
-- `cache ls|rm|gc`: list/remove/gc cache entries.
-- `auth login <target>`: stub for future store/repo auth.
+- `cache ls|rm|gc`: list cache entries, remove entries through retention-aware eviction, or clean orphaned cache state.
+- `auth login <tenant> [--token <token>]`: save GHCR auth for `store://greentic-biz/<tenant>/...`; if `--token` is omitted, the CLI prompts without echoing the token.
 
 Control cache location with `--cache-dir` or `GREENTIC_DIST_CACHE_DIR`; defaults to `${XDG_CACHE_HOME:-~/.cache}/greentic/components/<sha256>/component.wasm`. Set `GREENTIC_SILENCE_DEPRECATION_WARNINGS=1` to silence the temporary `greentic-distributor-client` shim binary warning.
 
@@ -121,11 +121,76 @@ Exit codes:
 - `2` invalid input (bad ref/lockfile/missing args)
 - `3` not found (cache miss)
 - `4` offline blocked (network needed)
-- `5` auth required/not implemented (repo://, store://)
+- `5` auth required/missing credentials (repo://, store://)
 - `10` internal error
 
 ## Library API (feature `dist-client`)
-Use `DistClient` to reuse the same resolution and cache logic programmatically. The `dist-client` feature also includes the OCI pack fetcher APIs (`fetch_pack`, `OciPackFetcher`):
+Use `DistClient` to reuse the same resolution and cache logic programmatically. The `dist-client` feature also includes the OCI pack fetcher APIs (`fetch_pack`, `OciPackFetcher`).
+
+The canonical PR-01 flow is:
+
+1. build an `ArtifactSource`
+2. call `resolve(...)` to get an `ArtifactDescriptor`
+3. call `fetch(...)` to materialize a local `ResolvedArtifact`
+4. later call `open_cached(...)` or `stat_cache(...)` using the digest/cache key
+
+```rust
+use greentic_distributor_client::dist::{
+    ArtifactSource, ArtifactSourceKind, CachePolicy, DistClient, DistOptions, ResolvePolicy,
+};
+
+let client = DistClient::new(DistOptions::default());
+let source = ArtifactSource {
+    raw_ref: "file:///tmp/my-component.wasm".into(),
+    kind: ArtifactSourceKind::File,
+    transport_hints: Default::default(),
+    dev_mode: true,
+};
+
+let descriptor = client.resolve(source, ResolvePolicy).await?;
+let resolved = client.fetch(&descriptor, CachePolicy).await?;
+let reopened = client.open_cached(&descriptor.digest)?;
+println!("canonical ref: {}", descriptor.canonical_ref);
+println!("path: {}", reopened.local_path.display());
+```
+
+Compatibility helpers like `resolve_ref(...)` and `ensure_cached(...)` still exist, but the digest-first descriptor/fetch/open flow is now the authoritative contract.
+
+The cache entry format is now persisted alongside fetched artifacts as a versioned `entry.json` record under a digest-keyed cache tree.
+
+The embedded lifecycle contract also exposes:
+- `stage_bundle(...)` to resolve, fetch, verify, and persist a stable `bundle_id`
+- `warm_bundle(...)` to reopen cached artifacts, rerun verification, and hand off to an `ArtifactOpener`
+- `rollback_bundle(...)` to reopen a previously staged bundle by `bundle_id` without network access
+- `stat_bundle(...)` / `list_bundles(...)` to inspect the persisted local `bundle_id -> cache_key/canonical_ref` reopen index
+- `set_bundle_state(...)` to transition bundle records between `staged`, `warming`, `ready`, `draining`, and `inactive`
+- `evaluate_retention(...)` / `apply_retention(...)` for deterministic GC decisions that protect active/session/rollback-relevant bundles
+
+That means the production-safe offline path is now:
+1. `stage_bundle(...)`
+2. persist the returned `bundle_id` and `canonical_ref` in operator state
+3. `warm_bundle(...)` for readiness checks and open-mode handoff
+4. `rollback_bundle(...)` by `bundle_id` if a later activation must be reverted
+5. `apply_retention(...)` when the operator wants explainable cache GC
+
+The persisted bundle index is now strict rather than fail-open:
+- malformed bundle record files surface as cache errors
+- automatic cache-pressure protection uses bundle lifecycle state, not just bundle existence
+
+`ArtifactOpener` is intentionally format-neutral. `greentic-distributor-client` owns reopen/verification/cache concerns; the owning crate for the artifact format should provide the actual open/parse implementation.
+
+Older cache helpers such as `evict_cache(...)`, `remove_cached(...)`, and `gc()` remain for compatibility, but they are now wrappers around or adjacent to the retention-aware cache lifecycle and should not be the primary production integration surface.
+
+The public source model supports:
+- `oci://...`
+- `https://...`
+- `file://...` or existing local paths
+- `fixture://...` when `fixture-resolver` is enabled
+- `repo://...` and `store://...` as source kinds
+
+`repo://...` is still a placeholder mapping source kind. `store://greentic-biz/<tenant>/<package-path>` maps to `ghcr.io/greentic-biz/<package-path>` and uses credentials saved with `auth login <tenant>`.
+
+Compatibility-only example:
 
 ```rust
 use greentic_distributor_client::dist::{DistClient, DistOptions};
@@ -178,4 +243,3 @@ println!("Loaded {} bytes", pack_bytes.len());
 ## Repo maintenance
 - Enable GitHub's "Allow auto-merge" setting for the repository.
 - Configure branch protection with the required checks you want enforced before merges.
-

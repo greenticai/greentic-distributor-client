@@ -9,6 +9,7 @@ use std::sync::{
 use greentic_distributor_client::oci_components::{
     ComponentResolveOptions, ComponentsExtension, ComponentsMode, OciComponentError,
     OciComponentResolver, PulledImage, PulledLayer, RegistryClient, ResolvedComponent,
+    ResolvedComponentDescriptor,
 };
 use oci_distribution::Reference;
 use oci_distribution::errors::OciDistributionError;
@@ -184,6 +185,38 @@ async fn allows_tag_refs_when_opted_in() {
     assert_eq!(results[0].resolved_digest, digest);
     assert!(results[0].path.exists());
     assert_eq!(mock.pulls(), 1);
+}
+
+#[tokio::test]
+async fn resolve_descriptor_does_not_require_cache_materialization() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = b"descriptor-only";
+    let digest = digest_for(data);
+    let reference = format!("ghcr.io/greentic/components@{digest}");
+
+    let mock =
+        MockRegistryClient::with_image(&reference, pulled_image(data, "application/wasm", &digest));
+    let resolver = OciComponentResolver::with_client(mock.clone(), options(&temp));
+
+    let ResolvedComponentDescriptor {
+        resolved_digest,
+        media_type,
+        size_bytes,
+        fetched_from_network,
+        ..
+    } = resolver.resolve_descriptor(&reference).await.unwrap();
+
+    assert_eq!(resolved_digest, digest);
+    assert_eq!(media_type, "application/wasm");
+    assert_eq!(size_bytes, data.len() as u64);
+    assert!(fetched_from_network);
+    assert_eq!(mock.pulls(), 1);
+    assert!(
+        !temp
+            .path()
+            .join(digest.trim_start_matches("sha256:"))
+            .exists()
+    );
 }
 
 #[tokio::test]

@@ -1,6 +1,7 @@
 #![cfg(feature = "dist-cli")]
 
 use assert_cmd::assert::OutputAssertExt;
+use greentic_distributor_client::store_auth::load_login;
 use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
@@ -54,4 +55,30 @@ fn cache_ls_rm_gc_json() {
     let removed: Vec<String> = serde_json::from_slice(&gc_out).unwrap();
     // After explicit rm, GC should be a no-op.
     assert!(removed.is_empty());
+}
+
+#[test]
+fn auth_login_persists_tenant_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let auth_path = temp.path().join("store-auth.json");
+
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("greentic-dist"));
+    cmd.args(["auth", "login", "tenant-a", "--token", "secret-token"]);
+    cmd.env(
+        "GREENTIC_DIST_STORE_SECRETS_PATH",
+        auth_path.to_string_lossy().into_owned(),
+    );
+    cmd.env(
+        "GREENTIC_DIST_STORE_STATE_PATH",
+        auth_path.to_string_lossy().into_owned(),
+    );
+    cmd.assert().success();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let saved = rt
+        .block_on(load_login(&auth_path, &auth_path, "tenant-a"))
+        .expect("saved login");
+    assert_eq!(saved.tenant, "tenant-a");
+    assert_eq!(saved.username, "tenant-a");
+    assert_eq!(saved.token, "secret-token");
 }

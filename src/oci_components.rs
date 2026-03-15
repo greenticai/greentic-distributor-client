@@ -99,6 +99,17 @@ pub struct ResolvedComponent {
     pub manifest_digest: Option<String>,
 }
 
+/// Descriptor-time resolution result for a single OCI component reference.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedComponentDescriptor {
+    pub original_reference: String,
+    pub resolved_digest: String,
+    pub media_type: String,
+    pub size_bytes: u64,
+    pub fetched_from_network: bool,
+    pub manifest_digest: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ComponentManifest {
     #[serde(default)]
@@ -165,6 +176,97 @@ impl<C: RegistryClient> OciComponentResolver<C> {
             results.push(self.resolve_single(reference).await?);
         }
         Ok(results)
+    }
+
+    pub async fn resolve_descriptors(
+        &self,
+        extension: &ComponentsExtension,
+    ) -> Result<Vec<ResolvedComponentDescriptor>, OciComponentError> {
+        let mut results = Vec::with_capacity(extension.refs.len());
+        for reference in &extension.refs {
+            results.push(self.resolve_descriptor(reference).await?);
+        }
+        Ok(results)
+    }
+
+    pub async fn resolve_descriptor(
+        &self,
+        reference: &str,
+    ) -> Result<ResolvedComponentDescriptor, OciComponentError> {
+        let parsed =
+            Reference::try_from(reference).map_err(|e| OciComponentError::InvalidReference {
+                reference: reference.to_string(),
+                reason: e.to_string(),
+            })?;
+
+        if parsed.digest().is_none() && !self.opts.allow_tags {
+            return Err(OciComponentError::DigestRequired {
+                reference: reference.to_string(),
+            });
+        }
+
+        let expected_digest = parsed.digest().map(normalize_digest);
+        if let Some(expected_digest) = expected_digest.as_ref() {
+            if let Some(hit) = self.cache.try_descriptor_hit(expected_digest, reference) {
+                return Ok(hit);
+            }
+            if self.opts.offline {
+                return Err(OciComponentError::OfflineMissing {
+                    reference: reference.to_string(),
+                    digest: expected_digest.clone(),
+                });
+            }
+        } else if self.opts.offline {
+            return Err(OciComponentError::OfflineTaggedReference {
+                reference: reference.to_string(),
+            });
+        }
+
+        let accepted_layer_types = self
+            .opts
+            .preferred_layer_media_types
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>();
+        let image = self
+            .client
+            .pull(&parsed, &accepted_layer_types)
+            .await
+            .map_err(|source| OciComponentError::PullFailed {
+                reference: reference.to_string(),
+                source,
+            })?;
+
+        let chosen_layer = select_layer(
+            &image.layers,
+            &self.opts.preferred_layer_media_types,
+            reference,
+        )?;
+        let resolved_digest = image
+            .digest
+            .clone()
+            .or_else(|| chosen_layer.digest.clone())
+            .unwrap_or_else(|| compute_digest(&chosen_layer.data));
+        let manifest_digest = image.digest.clone();
+
+        if let Some(expected) = expected_digest.as_ref()
+            && expected != &resolved_digest
+        {
+            return Err(OciComponentError::DigestMismatch {
+                reference: reference.to_string(),
+                expected: expected.clone(),
+                actual: resolved_digest.clone(),
+            });
+        }
+
+        Ok(ResolvedComponentDescriptor {
+            original_reference: reference.to_string(),
+            resolved_digest,
+            media_type: chosen_layer.media_type.clone(),
+            size_bytes: chosen_layer.data.len() as u64,
+            fetched_from_network: true,
+            manifest_digest,
+        })
     }
 
     async fn resolve_single(
@@ -476,6 +578,40 @@ impl OciCache {
         })
     }
 
+    fn try_descriptor_hit(
+        &self,
+        digest: &str,
+        reference: &str,
+    ) -> Option<ResolvedComponentDescriptor> {
+        let metadata = self.read_metadata(digest).ok();
+        let media_type = metadata
+            .as_ref()
+            .map(|m| m.media_type.clone())
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let manifest_wasm_name = metadata
+            .as_ref()
+            .and_then(|m| m.manifest_wasm_name.clone())
+            .or_else(|| self.manifest_wasm_name_from_cache(digest, reference));
+        let path =
+            self.artifact_path_for_media_type(digest, &media_type, manifest_wasm_name.as_deref());
+        if !path.exists() {
+            return None;
+        }
+        let size_bytes = metadata
+            .as_ref()
+            .map(|m| m.size_bytes)
+            .or_else(|| fs::metadata(&path).ok().map(|m| m.len()))
+            .unwrap_or_default();
+        Some(ResolvedComponentDescriptor {
+            original_reference: reference.to_string(),
+            resolved_digest: digest.to_string(),
+            media_type,
+            size_bytes,
+            fetched_from_network: false,
+            manifest_digest: metadata.and_then(|m| m.manifest_digest),
+        })
+    }
+
     fn read_metadata(&self, digest: &str) -> anyhow::Result<CacheMetadata> {
         let metadata_path = self.metadata_path(digest);
         let bytes = fs::read(metadata_path)?;
@@ -571,6 +707,13 @@ pub trait RegistryClient: Send + Sync {
 #[derive(Clone)]
 pub struct DefaultRegistryClient {
     inner: Client,
+    auth: RegistryClientAuth,
+}
+
+#[derive(Clone, Debug)]
+enum RegistryClientAuth {
+    Anonymous,
+    Basic { username: String, password: String },
 }
 
 impl Default for DefaultRegistryClient {
@@ -588,6 +731,7 @@ impl RegistryClient for DefaultRegistryClient {
         };
         Self {
             inner: Client::new(config),
+            auth: RegistryClientAuth::Anonymous,
         }
     }
 
@@ -596,15 +740,28 @@ impl RegistryClient for DefaultRegistryClient {
         reference: &Reference,
         accepted_manifest_types: &[&str],
     ) -> Result<PulledImage, OciDistributionError> {
+        let auth = match &self.auth {
+            RegistryClientAuth::Anonymous => RegistryAuth::Anonymous,
+            RegistryClientAuth::Basic { username, password } => {
+                RegistryAuth::Basic(username.clone(), password.clone())
+            }
+        };
         let image = self
             .inner
-            .pull(
-                reference,
-                &RegistryAuth::Anonymous,
-                accepted_manifest_types.to_vec(),
-            )
+            .pull(reference, &auth, accepted_manifest_types.to_vec())
             .await?;
         Ok(convert_image(image))
+    }
+}
+
+impl DefaultRegistryClient {
+    pub fn with_basic_auth(username: impl Into<String>, password: impl Into<String>) -> Self {
+        let mut client = Self::default_client();
+        client.auth = RegistryClientAuth::Basic {
+            username: username.into(),
+            password: password.into(),
+        };
+        client
     }
 }
 

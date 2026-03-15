@@ -1,9 +1,11 @@
-use crate::dist::{DistClient, DistOptions};
+use crate::dist::{CachePolicy, DistClient, DistOptions, ResolvePolicy};
 #[cfg(feature = "pack-fetch")]
 use crate::oci_packs::{
     DefaultRegistryClient, OciPackFetcher, PackFetchOptions, RegistryClient, ResolvedPack,
 };
+use crate::store_auth::save_login;
 use clap::{Parser, Subcommand};
+use rpassword::prompt_password;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -89,8 +91,12 @@ pub enum CacheCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum AuthCommand {
-    /// Stub login hook for future repo/store auth
-    Login { target: String },
+    /// Save GHCR credentials for a tenant used by store://greentic-biz/<tenant>/...
+    Login {
+        tenant: String,
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 #[derive(Serialize)]
@@ -145,6 +151,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
 }
 
 #[cfg(feature = "pack-fetch")]
+#[allow(deprecated)]
 pub async fn run_with_pack_client<C: RegistryClient>(
     cli: Cli,
     pack_client: C,
@@ -156,23 +163,28 @@ pub async fn run_with_pack_client<C: RegistryClient>(
         opts.cache_dir = dir;
     }
     opts.offline = offline || opts.offline;
+    let store_auth_path = opts.store_auth_path.clone();
+    let store_state_path = opts.store_state_path.clone();
 
     let client = DistClient::new(opts);
 
     match cli.command {
         Commands::Resolve { reference, json } => {
-            let resolved = client
-                .resolve_ref(&reference)
+            let source = client
+                .parse_source(&reference)
+                .map_err(CliError::from_dist)?;
+            let descriptor = client
+                .resolve(source, ResolvePolicy)
                 .await
                 .map_err(CliError::from_dist)?;
             if json {
                 let out = ResolveOutput {
                     reference: &reference,
-                    digest: &resolved.digest,
+                    digest: &descriptor.digest,
                 };
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
             } else {
-                println!("{}", resolved.digest);
+                println!("{}", descriptor.digest);
             }
         }
         Commands::Pull {
@@ -207,8 +219,15 @@ pub async fn run_with_pack_client<C: RegistryClient>(
                     }
                 }
             } else if let Some(reference) = reference {
+                let source = client
+                    .parse_source(&reference)
+                    .map_err(CliError::from_dist)?;
+                let descriptor = client
+                    .resolve(source, ResolvePolicy)
+                    .await
+                    .map_err(CliError::from_dist)?;
                 let resolved = client
-                    .ensure_cached(&reference)
+                    .fetch(&descriptor, CachePolicy)
                     .await
                     .map_err(CliError::from_dist)?;
                 if json {
@@ -243,11 +262,14 @@ pub async fn run_with_pack_client<C: RegistryClient>(
                 }
             }
             CacheCommand::Rm { digests, json } => {
-                client
-                    .remove_cached(&digests)
-                    .map_err(CliError::from_dist)?;
+                let report = client.evict_cache(&digests).map_err(CliError::from_dist)?;
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&digests).unwrap());
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                } else if report.evicted > 0 {
+                    eprintln!(
+                        "evicted {} entries, reclaimed {} bytes",
+                        report.evicted, report.bytes_reclaimed
+                    );
                 }
             }
             CacheCommand::Gc { json } => {
@@ -260,13 +282,23 @@ pub async fn run_with_pack_client<C: RegistryClient>(
             }
         },
         Commands::Auth { command } => match command {
-            AuthCommand::Login { target } => {
-                return Err(CliError {
-                    code: 5,
-                    message: format!(
-                        "auth login for `{target}` is not implemented yet; stubbed for future store/repo"
-                    ),
-                });
+            AuthCommand::Login { tenant, token } => {
+                let token = match token {
+                    Some(token) => token,
+                    None => prompt_password(format!("GHCR token for tenant `{tenant}`: "))
+                        .map_err(|err| CliError {
+                            code: 10,
+                            message: format!("failed to read token: {err}"),
+                        })?,
+                };
+                save_login(&store_auth_path, &store_state_path, &tenant, &token)
+                    .await
+                    .map_err(|err| CliError {
+                        code: 5,
+                        message: err.to_string(),
+                    })?;
+                eprintln!("saved auth for tenant `{tenant}` for store://greentic-biz/{tenant}/...");
+                return Ok(());
             }
         },
         Commands::Inspect {
