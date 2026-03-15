@@ -54,6 +54,8 @@ rpassword = "7"
 httpmock = "0.8"
 tempfile = { workspace = true }
 assert_cmd = "2"
+flate2 = "1"
+tar = "0.4"
 
 [[bin]]
 name = "greentic-dist"

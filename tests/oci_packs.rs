@@ -1,11 +1,15 @@
 #![cfg(feature = "pack-fetch")]
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use greentic_distributor_client::oci_packs::{
     OciPackError, OciPackFetcher, PackFetchOptions, PulledImage, PulledLayer, RegistryClient,
     default_pack_layer_media_types, fetch_pack_to_cache_with_options_and_client,
@@ -13,6 +17,7 @@ use greentic_distributor_client::oci_packs::{
 use oci_distribution::Reference;
 use oci_distribution::errors::OciDistributionError;
 use sha2::{Digest, Sha256};
+use tar::{Archive, Builder, Header};
 use tempfile::TempDir;
 
 #[derive(Clone, Default)]
@@ -88,6 +93,36 @@ fn pulled_image_with_layers(layers: Vec<PulledLayer>) -> PulledImage {
         digest: None,
         layers,
     }
+}
+
+fn tar_gzip_bundle(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let mut builder = Builder::new(encoder);
+    for (path, bytes) in entries {
+        let mut header = Header::new_gnu();
+        header.set_path(path).unwrap();
+        header.set_mode(0o644);
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        builder.append(&header, *bytes).unwrap();
+    }
+    let encoder = builder.into_inner().unwrap();
+    encoder.finish().unwrap()
+}
+
+fn read_tar_gzip_entry(bytes: &[u8], path: &str) -> Vec<u8> {
+    let decoder = GzDecoder::new(bytes);
+    let mut archive = Archive::new(decoder);
+    let mut found = Vec::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let entry_path = entry.path().unwrap().to_string_lossy().into_owned();
+        if entry_path == path {
+            entry.read_to_end(&mut found).unwrap();
+            return found;
+        }
+    }
+    panic!("missing tar entry {path}");
 }
 
 #[tokio::test]
@@ -348,6 +383,43 @@ async fn top_level_fetch_helper_accepts_custom_tarball_media_type_when_appended(
         .unwrap();
 
     assert_eq!(std::fs::read(via_helper.path).unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn fetches_targzip_bundle_and_downstream_can_open_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let bundle_bytes = tar_gzip_bundle(&[
+        ("bundle/manifest.json", br#"{"name":"zain-x"}"#),
+        ("bundle/data.txt", b"hello-zain-x"),
+    ]);
+    let digest = digest_for(&bundle_bytes);
+    let reference = "ghcr.io/greentic-biz/zain-x-bundle:latest";
+
+    let image = pulled_image_with_layers(vec![PulledLayer {
+        media_type: "application/vnd.greentic.zain-x.bundle.v1+tar+gzip".to_string(),
+        data: bundle_bytes.clone(),
+        digest: Some(digest),
+    }]);
+    let mock = MockRegistryClient::with_image(reference, image);
+    let mut opts = options(&temp);
+    opts.allow_tags = true;
+    let resolved = fetch_pack_to_cache_with_options_and_client(reference, opts, mock)
+        .await
+        .unwrap();
+
+    let cached_bytes = std::fs::read(&resolved.path).unwrap();
+    assert_eq!(
+        resolved.media_type,
+        "application/vnd.greentic.zain-x.bundle.v1+tar+gzip"
+    );
+    assert_eq!(
+        read_tar_gzip_entry(&cached_bytes, "bundle/manifest.json"),
+        br#"{"name":"zain-x"}"#
+    );
+    assert_eq!(
+        read_tar_gzip_entry(&cached_bytes, "bundle/data.txt"),
+        b"hello-zain-x"
+    );
 }
 
 #[test]

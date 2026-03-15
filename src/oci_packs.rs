@@ -531,19 +531,29 @@ impl DefaultRegistryClient {
             .pull_manifest(reference, &RegistryAuth::Anonymous)
             .await?;
         if let OciManifest::Image(image_manifest) = manifest {
-            for layer in image_manifest.layers {
-                if accepted
+            extend_accepted_media_types_from_layers(
+                &mut accepted,
+                image_manifest
+                    .layers
                     .iter()
-                    .any(|accepted| accepted == &layer.media_type)
-                {
-                    continue;
-                }
-                if is_generic_tarball_media_type(&layer.media_type) {
-                    accepted.push(layer.media_type);
-                }
-            }
+                    .map(|layer| layer.media_type.as_str()),
+            );
         }
         Ok(accepted)
+    }
+}
+
+fn extend_accepted_media_types_from_layers<'a, I>(accepted: &mut Vec<String>, layer_media_types: I)
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    for media_type in layer_media_types {
+        if accepted.iter().any(|accepted| accepted == media_type) {
+            continue;
+        }
+        if is_generic_tarball_media_type(media_type) {
+            accepted.push(media_type.to_string());
+        }
     }
 }
 
@@ -555,7 +565,10 @@ fn is_generic_tarball_media_type(media_type: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_generic_tarball_media_type;
+    use super::{
+        default_pack_layer_media_types, extend_accepted_media_types_from_layers,
+        is_generic_tarball_media_type,
+    };
 
     #[test]
     fn generic_tarball_media_types_are_allowed() {
@@ -571,6 +584,18 @@ mod tests {
         assert!(!is_generic_tarball_media_type(
             "application/vnd.greentic.zain-x.bundle.v1+zip"
         ));
+    }
+
+    #[test]
+    fn accepted_media_types_expand_for_generic_tarball_layers() {
+        let mut accepted = default_pack_layer_media_types();
+        extend_accepted_media_types_from_layers(
+            &mut accepted,
+            ["application/vnd.greentic.zain-x.bundle.v1+tar+gzip"],
+        );
+        assert!(
+            accepted.contains(&"application/vnd.greentic.zain-x.bundle.v1+tar+gzip".to_string())
+        );
     }
 }
 
