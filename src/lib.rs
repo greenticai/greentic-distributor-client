@@ -26,14 +26,14 @@ pub use dist::{
     ArtifactOpener, ArtifactSource, ArtifactSourceKind, ArtifactType, BundleLifecycleState,
     BundleManifestSummary, BundleOpenMode, BundleOpenOutput, BundleOpenRequest, BundleOpener,
     BundleRecord, CacheEntry, CacheEntryState, CachePolicy, DistClient, DistOptions,
-    InjectedResolution, IntegrationError, IntegrationErrorCode, IntegrityState, LockHint,
-    PreliminaryDecision, ReleaseTrainDescriptor, ResolvePolicy, ResolveRefInjector,
-    ResolveRefRequest, ResolvedArtifact, ResolvedVia, RetentionDecision, RetentionDisposition,
-    RetentionEnvironment, RetentionInput, RetentionOutcome, RetentionReport, RollbackAuditFields,
-    RollbackBundleInput, RollbackBundleResult, SourceSnapshot, StageAuditFields, StageBundleInput,
-    StageBundleResult, TransportHints, VerificationCheck, VerificationEnvironment,
-    VerificationOutcome, VerificationPolicy, VerificationReport, WarmAuditFields, WarmBundleInput,
-    WarmBundleResult,
+    DownloadedStoreArtifact, InjectedResolution, IntegrationError, IntegrationErrorCode,
+    IntegrityState, LockHint, PreliminaryDecision, ReleaseTrainDescriptor, ResolvePolicy,
+    ResolveRefInjector, ResolveRefRequest, ResolvedArtifact, ResolvedVia, RetentionDecision,
+    RetentionDisposition, RetentionEnvironment, RetentionInput, RetentionOutcome, RetentionReport,
+    RollbackAuditFields, RollbackBundleInput, RollbackBundleResult, SourceSnapshot,
+    StageAuditFields, StageBundleInput, StageBundleResult, TransportHints, VerificationCheck,
+    VerificationEnvironment, VerificationOutcome, VerificationPolicy, VerificationReport,
+    WarmAuditFields, WarmBundleInput, WarmBundleResult,
 };
 pub use error::DistributorError;
 #[cfg(feature = "http-runtime")]
