@@ -1,9 +1,9 @@
-name: Dev Publish crates (distributor-client)
+﻿name: Dev Publish crates (distributor-client)
 
 on:
   push:
     branches: [ develop ]
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
