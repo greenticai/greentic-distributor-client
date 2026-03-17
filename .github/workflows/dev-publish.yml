@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-      AWS_REGION: ${{ secrets.AWS_REGION || 'eu-north-1' }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
     permissions:
       contents: read
     steps:
