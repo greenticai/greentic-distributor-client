@@ -159,7 +159,15 @@ pub async fn load_login(
 }
 
 async fn load_state(path: &Path) -> Result<Option<StoreAuthState>, StoreAuthError> {
-    let store = open_store(path)?;
+    let store = match open_store(path) {
+        Ok(store) => store,
+        Err(StoreAuthError::SecretStore(message))
+            if message.contains("No such file or directory (os error 2)") =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
     let bytes = match store.get("secrets://prod/dist/_/store/auth_state").await {
         Ok(bytes) => bytes,
         Err(err) if err.to_string().contains("not found") => return Ok(None),
@@ -239,5 +247,24 @@ mod tests {
         assert_eq!(loaded.tenant, "tenant-b");
         assert_eq!(loaded.username, "tenant-b");
         assert_eq!(loaded.token, "other-secret");
+    }
+
+    #[tokio::test]
+    async fn missing_store_directory_returns_login_required_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let auth_path = temp.path().join("missing").join("store-auth.json");
+        let state_path = auth_path.clone();
+
+        let err = load_login(&auth_path, &state_path, "tenant-c")
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "no saved store login found at `{}`; run `greentic-dist auth login <tenant>` first",
+                auth_path.display()
+            )
+        );
     }
 }

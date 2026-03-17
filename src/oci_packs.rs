@@ -472,6 +472,13 @@ pub trait RegistryClient: Send + Sync {
 #[derive(Clone)]
 pub struct DefaultRegistryClient {
     inner: Client,
+    auth: RegistryClientAuth,
+}
+
+#[derive(Clone, Debug)]
+enum RegistryClientAuth {
+    Anonymous,
+    Basic { username: String, password: String },
 }
 
 impl Default for DefaultRegistryClient {
@@ -489,6 +496,7 @@ impl RegistryClient for DefaultRegistryClient {
         };
         Self {
             inner: Client::new(config),
+            auth: RegistryClientAuth::Anonymous,
         }
     }
 
@@ -504,19 +512,30 @@ impl RegistryClient for DefaultRegistryClient {
             .iter()
             .map(|media_type| media_type.as_str())
             .collect::<Vec<_>>();
+        let auth = match &self.auth {
+            RegistryClientAuth::Anonymous => RegistryAuth::Anonymous,
+            RegistryClientAuth::Basic { username, password } => {
+                RegistryAuth::Basic(username.clone(), password.clone())
+            }
+        };
         let image = self
             .inner
-            .pull(
-                reference,
-                &RegistryAuth::Anonymous,
-                accepted_media_type_refs,
-            )
+            .pull(reference, &auth, accepted_media_type_refs)
             .await?;
         Ok(convert_image(image))
     }
 }
 
 impl DefaultRegistryClient {
+    pub fn with_basic_auth(username: impl Into<String>, password: impl Into<String>) -> Self {
+        let mut client = Self::default_client();
+        client.auth = RegistryClientAuth::Basic {
+            username: username.into(),
+            password: password.into(),
+        };
+        client
+    }
+
     async fn expand_accepted_media_types(
         &self,
         reference: &Reference,
@@ -526,10 +545,13 @@ impl DefaultRegistryClient {
             .iter()
             .map(|media_type| (*media_type).to_string())
             .collect::<Vec<_>>();
-        let (manifest, _) = self
-            .inner
-            .pull_manifest(reference, &RegistryAuth::Anonymous)
-            .await?;
+        let auth = match &self.auth {
+            RegistryClientAuth::Anonymous => RegistryAuth::Anonymous,
+            RegistryClientAuth::Basic { username, password } => {
+                RegistryAuth::Basic(username.clone(), password.clone())
+            }
+        };
+        let (manifest, _) = self.inner.pull_manifest(reference, &auth).await?;
         if let OciManifest::Image(image_manifest) = manifest {
             extend_accepted_media_types_from_layers(
                 &mut accepted,

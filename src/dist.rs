@@ -1,4 +1,10 @@
-use crate::oci_components::{ComponentResolveOptions, DefaultRegistryClient, OciComponentResolver};
+use crate::oci_components::{
+    ComponentResolveOptions, DefaultRegistryClient as ComponentRegistryClient, OciComponentError,
+    OciComponentResolver,
+};
+use crate::oci_packs::{
+    DefaultRegistryClient as PackRegistryClient, OciPackFetcher, PackFetchOptions,
+};
 use crate::store_auth::{
     StoreCredentials, default_store_auth_path, default_store_state_path, load_login,
 };
@@ -776,7 +782,7 @@ fn legacy_source_from_public(source: &ArtifactSource) -> LegacyArtifactSource {
 
 pub struct DistClient {
     cache: ComponentCache,
-    oci: OciComponentResolver<DefaultRegistryClient>,
+    oci: OciComponentResolver<ComponentRegistryClient>,
     http: reqwest::Client,
     opts: DistOptions,
     injected: Option<Arc<dyn ResolveRefInjector>>,
@@ -790,6 +796,8 @@ struct DefaultArtifactOpener;
 pub struct OciCacheInspection {
     pub digest: String,
     pub cache_dir: PathBuf,
+    pub artifact_path: PathBuf,
+    pub artifact_type: ArtifactType,
     pub selected_media_type: String,
     pub fetched: bool,
 }
@@ -1010,14 +1018,14 @@ impl DistClient {
         &self,
         reference: &str,
     ) -> Result<ArtifactDescriptor, DistError> {
-        self.resolve_oci_descriptor_with_client(reference, DefaultRegistryClient::default())
+        self.resolve_oci_descriptor_with_client(reference, ComponentRegistryClient::default())
             .await
     }
 
     async fn resolve_oci_descriptor_with_client(
         &self,
         reference: &str,
-        client: DefaultRegistryClient,
+        client: ComponentRegistryClient,
     ) -> Result<ArtifactDescriptor, DistError> {
         let resolver = OciComponentResolver::with_client(client, self.oci_resolve_options());
         let resolved = resolver
@@ -1054,6 +1062,15 @@ impl DistClient {
         }
     }
 
+    fn oci_pack_options(&self) -> PackFetchOptions {
+        PackFetchOptions {
+            allow_tags: self.opts.allow_tags,
+            offline: self.opts.offline,
+            cache_dir: self.opts.cache_dir.join("legacy-packs"),
+            ..Default::default()
+        }
+    }
+
     async fn load_store_credentials(&self, tenant: &str) -> Result<StoreCredentials, DistError> {
         load_login(
             &self.opts.store_auth_path,
@@ -1064,15 +1081,57 @@ impl DistClient {
         .map_err(|err| DistError::StoreAuth(err.to_string()))
     }
 
-    async fn greentic_biz_store_client(
+    async fn greentic_biz_store_component_client(
         &self,
         tenant: &str,
-    ) -> Result<DefaultRegistryClient, DistError> {
+    ) -> Result<ComponentRegistryClient, DistError> {
         let credentials = self.load_store_credentials(tenant).await?;
-        Ok(DefaultRegistryClient::with_basic_auth(
+        Ok(ComponentRegistryClient::with_basic_auth(
             credentials.username,
             credentials.token,
         ))
+    }
+
+    async fn greentic_biz_store_pack_client(
+        &self,
+        tenant: &str,
+    ) -> Result<PackRegistryClient, DistError> {
+        let credentials = self.load_store_credentials(tenant).await?;
+        Ok(PackRegistryClient::with_basic_auth(
+            credentials.username,
+            credentials.token,
+        ))
+    }
+
+    async fn resolve_oci_pack_descriptor_with_client(
+        &self,
+        reference: &str,
+        client: PackRegistryClient,
+    ) -> Result<ArtifactDescriptor, DistError> {
+        let fetcher = OciPackFetcher::with_client(client, self.oci_pack_options());
+        let resolved = fetcher
+            .fetch_pack_to_cache(reference)
+            .await
+            .map_err(|err| DistError::Pack(err.to_string()))?;
+        Ok(ArtifactDescriptor {
+            artifact_type: ArtifactType::Bundle,
+            source_kind: ArtifactSourceKind::Oci,
+            raw_ref: format!("oci://{reference}"),
+            canonical_ref: canonical_oci_ref(reference, &resolved.resolved_digest),
+            digest: resolved.resolved_digest,
+            media_type: resolved.media_type,
+            size_bytes: file_size_if_exists(&resolved.path).unwrap_or_default(),
+            created_at: None,
+            annotations: serde_json::Map::new(),
+            manifest_digest: resolved.manifest_digest,
+            resolved_via: if reference.contains(':') && !reference.contains("@sha256:") {
+                ResolvedVia::TagResolution
+            } else {
+                ResolvedVia::Direct
+            },
+            signature_refs: Vec::new(),
+            sbom_refs: Vec::new(),
+        })
     }
 
     async fn resolve_greentic_biz_store_descriptor(
@@ -1080,10 +1139,24 @@ impl DistClient {
         target: &str,
     ) -> Result<ArtifactDescriptor, DistError> {
         let parsed = parse_greentic_biz_store_target(target)?;
-        let client = self.greentic_biz_store_client(&parsed.tenant).await?;
-        let mut descriptor = self
-            .resolve_oci_descriptor_with_client(&parsed.mapped_reference, client)
-            .await?;
+        let mut descriptor = match self
+            .resolve_oci_descriptor_with_client(
+                &parsed.mapped_reference,
+                self.greentic_biz_store_component_client(&parsed.tenant)
+                    .await?,
+            )
+            .await
+        {
+            Ok(descriptor) => descriptor,
+            Err(DistError::Oci(err)) if should_retry_store_as_pack(&err) => {
+                self.resolve_oci_pack_descriptor_with_client(
+                    &parsed.mapped_reference,
+                    self.greentic_biz_store_pack_client(&parsed.tenant).await?,
+                )
+                .await?
+            }
+            Err(err) => return Err(err),
+        };
         descriptor.source_kind = ArtifactSourceKind::Store;
         descriptor.raw_ref = format!("store://{target}");
         descriptor.resolved_via = ResolvedVia::StoreMapping;
@@ -1095,7 +1168,7 @@ impl DistClient {
         reference: &str,
         source: LegacyArtifactSource,
         component_id: String,
-        client: DefaultRegistryClient,
+        client: ComponentRegistryClient,
     ) -> Result<ResolvedArtifact, DistError> {
         if self.opts.offline {
             return Err(DistError::Offline {
@@ -1148,6 +1221,57 @@ impl DistClient {
         self.enforce_cache_cap(Some(&resolved.descriptor.digest))?;
         resolved.validate_payload()?;
         Ok(resolved)
+    }
+
+    async fn pull_oci_pack_with_source_and_client(
+        &self,
+        reference: &str,
+        source: LegacyArtifactSource,
+        component_id: String,
+        client: PackRegistryClient,
+    ) -> Result<ResolvedArtifact, DistError> {
+        if self.opts.offline {
+            return Err(DistError::Offline {
+                reference: reference.to_string(),
+            });
+        }
+        let fetcher = OciPackFetcher::with_client(client, self.oci_pack_options());
+        let resolved = fetcher
+            .fetch_pack_to_cache(reference)
+            .await
+            .map_err(|err| DistError::Pack(err.to_string()))?;
+        let resolved_bytes = fs::read(&resolved.path).map_err(|source| DistError::CacheError {
+            path: resolved.path.display().to_string(),
+            source,
+        })?;
+        let resolved_digest = resolved.resolved_digest.clone();
+        let mut artifact = ResolvedArtifact::from_path(
+            resolved_digest.clone(),
+            self.cache
+                .write_component(&resolved_digest, &resolved_bytes)
+                .map_err(|source| DistError::CacheError {
+                    path: self
+                        .cache
+                        .component_path(&resolved_digest)
+                        .display()
+                        .to_string(),
+                    source,
+                })?,
+            component_id,
+            None,
+            None,
+            Some(resolved_bytes.len() as u64),
+            Some(resolved.media_type.clone()),
+            resolved.fetched_from_network,
+            source,
+        );
+        artifact.descriptor.artifact_type = ArtifactType::Bundle;
+        artifact.descriptor.media_type = resolved.media_type;
+        artifact.descriptor.manifest_digest = resolved.manifest_digest;
+        self.persist_cache_entry(&artifact)?;
+        self.enforce_cache_cap(Some(&artifact.descriptor.digest))?;
+        artifact.validate_payload()?;
+        Ok(artifact)
     }
 
     fn persist_cache_entry(&self, artifact: &ResolvedArtifact) -> Result<(), DistError> {
@@ -2096,15 +2220,28 @@ impl DistClient {
     async fn resolve_store_ref(&self, target: &str) -> Result<ResolvedArtifact, DistError> {
         if is_greentic_biz_store_target(target) {
             let parsed = parse_greentic_biz_store_target(target)?;
-            let client = self.greentic_biz_store_client(&parsed.tenant).await?;
-            return self
+            return match self
                 .pull_oci_with_source_and_client(
                     &parsed.mapped_reference,
                     LegacyArtifactSource::Store(format!("store://{target}")),
                     target.to_string(),
-                    client,
+                    self.greentic_biz_store_component_client(&parsed.tenant)
+                        .await?,
                 )
-                .await;
+                .await
+            {
+                Ok(artifact) => Ok(artifact),
+                Err(DistError::Oci(err)) if should_retry_store_as_pack(&err) => {
+                    self.pull_oci_pack_with_source_and_client(
+                        &parsed.mapped_reference,
+                        LegacyArtifactSource::Store(format!("store://{target}")),
+                        target.to_string(),
+                        self.greentic_biz_store_pack_client(&parsed.tenant).await?,
+                    )
+                    .await
+                }
+                Err(err) => Err(err),
+            };
         }
         if self.opts.store_registry_base.is_none() {
             return Err(DistError::ResolutionUnavailable {
@@ -2257,6 +2394,31 @@ impl DistClient {
         &self,
         reference: &str,
     ) -> Result<OciCacheInspection, DistError> {
+        if let RefKind::Store(target) = classify_reference(reference)?
+            && is_greentic_biz_store_target(&target)
+        {
+            let resolved = self.resolve_store_ref(&target).await?;
+            let artifact_path =
+                resolved
+                    .cache_path
+                    .clone()
+                    .ok_or_else(|| DistError::CorruptArtifact {
+                        reference: reference.to_string(),
+                        reason: "resolved store artifact missing cache path".into(),
+                    })?;
+            let cache_dir = artifact_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .ok_or_else(|| DistError::InvalidInput("cache path missing parent".into()))?;
+            return Ok(OciCacheInspection {
+                digest: resolved.descriptor.digest.clone(),
+                cache_dir,
+                artifact_path,
+                artifact_type: resolved.descriptor.artifact_type.clone(),
+                selected_media_type: resolved.descriptor.media_type.clone(),
+                fetched: resolved.fetched,
+            });
+        }
         if self.opts.offline {
             return Err(DistError::Offline {
                 reference: reference.to_string(),
@@ -2284,6 +2446,8 @@ impl DistClient {
         Ok(OciCacheInspection {
             digest: resolved.resolved_digest,
             cache_dir,
+            artifact_path: resolved.path,
+            artifact_type: ArtifactType::Component,
             selected_media_type: resolved.media_type,
             fetched: resolved.fetched_from_network,
         })
@@ -2337,6 +2501,8 @@ pub enum DistError {
     StoreAuth(String),
     #[error("oci error: {0}")]
     Oci(#[from] crate::oci_components::OciComponentError),
+    #[error("oci pack error: {0}")]
+    Pack(String),
     #[error("invalid lockfile: {0}")]
     Serde(#[from] serde_json::Error),
 }
@@ -2436,6 +2602,12 @@ impl IntegrationError {
             DistError::Oci(source) => Self {
                 code: IntegrationErrorCode::ResolutionFailed,
                 summary: source.to_string(),
+                retryable: true,
+                details: None,
+            },
+            DistError::Pack(summary) => Self {
+                code: IntegrationErrorCode::ResolutionFailed,
+                summary,
                 retryable: true,
                 details: None,
             },
@@ -3574,6 +3746,11 @@ fn normalize_content_type(current: Option<&str>, fallback: &str) -> String {
     }
 }
 
+fn should_retry_store_as_pack(err: &OciComponentError) -> bool {
+    let message = err.to_string();
+    message.contains("Incompatible layer media type") || message.contains("component layer missing")
+}
+
 fn file_size_if_exists(path: &Path) -> Option<u64> {
     path.metadata().ok().map(|m| m.len())
 }
@@ -3943,5 +4120,16 @@ mod tests {
             resolve_abi_version_from_cache(&wasm),
             Some("1.2.3".to_string())
         );
+    }
+
+    #[test]
+    fn retries_store_resolution_as_pack_for_non_component_layers() {
+        assert!(should_retry_store_as_pack(&OciComponentError::PullFailed {
+            reference: "ghcr.io/greentic-biz/zain-x-bundle:latest".to_string(),
+            source: oci_distribution::errors::OciDistributionError::GenericError(Some(
+                "Incompatible layer media type: application/vnd.greentic.zain-x.bundle.v1+tar+gzip"
+                    .to_string(),
+            )),
+        }));
     }
 }
