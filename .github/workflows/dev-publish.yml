@@ -1,4 +1,4 @@
-name: Dev Publish crates (distributor-client)
+﻿name: Dev Publish crates (distributor-client)
 
 on:
   push:
