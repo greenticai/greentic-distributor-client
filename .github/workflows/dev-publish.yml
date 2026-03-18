@@ -47,6 +47,7 @@ jobs:
           base_version=$(grep -E '^version\s*=' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
           dev_version="${base_version}-dev.${GITHUB_RUN_NUMBER}"
           sed -i -E "0,/^version = \"[^\"]+\"/s//version = \"${dev_version}\"/" Cargo.toml
+          sed -i -E "s/(greentic-distributor-client\\s*=\\s*\\{[^}]*version\\s*=\\s*\")[^\"]+(\".*)/\\1${dev_version}\\2/" Cargo.toml
           cargo publish -p greentic-distributor-client --registry corp-artifacts-greentic --allow-dirty
           sleep 5
           cargo publish -p greentic-distributor-dev --registry corp-artifacts-greentic --allow-dirty
