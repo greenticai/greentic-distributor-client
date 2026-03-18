@@ -40,6 +40,7 @@ jobs:
           token=$(aws codeartifact get-authorization-token --domain ${{ secrets.CODEARTIFACT_DOMAIN }} --domain-owner ${{ secrets.CODEARTIFACT_DOMAIN_OWNER }} --region eu-north-1 --query authorizationToken --output text)
           echo "::add-mask::$token"
           echo "CARGO_REGISTRIES_CORP_ARTIFACTS_GREENTIC_TOKEN=$token" >> $GITHUB_ENV
+          export CARGO_REGISTRIES_CORP_ARTIFACTS_GREENTIC_TOKEN="$token"
           endpoint=$(aws codeartifact get-repository-endpoint --domain ${{ secrets.CODEARTIFACT_DOMAIN }} --domain-owner ${{ secrets.CODEARTIFACT_DOMAIN_OWNER }} --repository greentic --format cargo --region eu-north-1 --query repositoryEndpoint --output text)
           mkdir -p .cargo
           printf '[registries.corp-artifacts-greentic]\nindex = "sparse+%s"\ncredential-provider = "cargo:token"\n' "$endpoint" > .cargo/config.toml
