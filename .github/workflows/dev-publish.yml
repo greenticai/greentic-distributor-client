@@ -75,10 +75,10 @@ jobs:
             --output text)
           mkdir -p .cargo
           cat > .cargo/config.toml <<EOF
-[registries.corp-artifacts-greentic]
-index = "sparse+${endpoint}"
-credential-provider = "cargo:token"
-EOF
+          [registries.corp-artifacts-greentic]
+          index = "sparse+${endpoint}"
+          credential-provider = "cargo:token"
+          EOF
 
       - name: Set dev version
         shell: bash
