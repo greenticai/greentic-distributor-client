@@ -157,7 +157,7 @@ async fn cli_fetches_targzip_bundle_and_downstream_can_open_it() {
         ("bundle/data.txt", b"hello-zain-x"),
     ]);
     let digest = digest_for(&bundle_bytes);
-    let reference = "ghcr.io/greentic-biz/zain-x-bundle:latest";
+    let reference = "ghcr.io/greentic-biz/bundles/zain-x-bundle:latest";
 
     let image = pulled_image(
         &bundle_bytes,

@@ -4370,7 +4370,7 @@ mod tests {
     #[test]
     fn retries_store_resolution_as_pack_for_non_component_layers() {
         assert!(should_retry_store_as_pack(&OciComponentError::PullFailed {
-            reference: "ghcr.io/greentic-biz/zain-x-bundle:latest".to_string(),
+            reference: "ghcr.io/greentic-biz/bundles/zain-x-bundle:latest".to_string(),
             source: oci_distribution::errors::OciDistributionError::GenericError(Some(
                 "Incompatible layer media type: application/vnd.greentic.zain-x.bundle.v1+tar+gzip"
                     .to_string(),

@@ -393,7 +393,7 @@ async fn fetches_targzip_bundle_and_downstream_can_open_it() {
         ("bundle/data.txt", b"hello-zain-x"),
     ]);
     let digest = digest_for(&bundle_bytes);
-    let reference = "ghcr.io/greentic-biz/zain-x-bundle:latest";
+    let reference = "ghcr.io/greentic-biz/bundles/zain-x-bundle:latest";
 
     let image = pulled_image_with_layers(vec![PulledLayer {
         media_type: "application/vnd.greentic.zain-x.bundle.v1+tar+gzip".to_string(),
