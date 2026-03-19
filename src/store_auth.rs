@@ -159,11 +159,10 @@ pub async fn load_login(
 }
 
 async fn load_state(path: &Path) -> Result<Option<StoreAuthState>, StoreAuthError> {
+    ensure_parent_dir(path)?;
     let store = match open_store(path) {
         Ok(store) => store,
-        Err(StoreAuthError::SecretStore(message))
-            if message.contains("No such file or directory (os error 2)") =>
-        {
+        Err(StoreAuthError::SecretStore(message)) if is_missing_store_path_error(&message) => {
             return Ok(None);
         }
         Err(err) => return Err(err),
@@ -209,6 +208,11 @@ fn ensure_parent_dir(path: &Path) -> Result<(), StoreAuthError> {
         })?;
     }
     Ok(())
+}
+
+fn is_missing_store_path_error(message: &str) -> bool {
+    message.contains("No such file or directory (os error 2)")
+        || message.contains("The system cannot find the path specified. (os error 3)")
 }
 
 #[cfg(test)]
@@ -259,6 +263,27 @@ mod tests {
             .await
             .unwrap_err();
 
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "no saved store login found at `{}`; run `greentic-dist auth login <tenant>` first",
+                auth_path.display()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn load_login_creates_missing_parent_directory_before_opening_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let auth_dir = temp.path().join("nested").join("auth");
+        let auth_path = auth_dir.join("store-auth.json");
+        let state_path = auth_path.clone();
+
+        let err = load_login(&auth_path, &state_path, "tenant-d")
+            .await
+            .unwrap_err();
+
+        assert!(auth_dir.is_dir());
         assert_eq!(
             err.to_string(),
             format!(
