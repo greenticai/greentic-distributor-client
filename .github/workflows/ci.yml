@@ -3,6 +3,7 @@ permissions:
   contents: read
 
 on:
+  workflow_call:
   pull_request:
   push:
     branches: [main, master]
@@ -13,10 +14,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Set up Rust
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@1.91.0
         with:
-          toolchain: 1.91.0
-          override: true
           components: rustfmt, clippy
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
