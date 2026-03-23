@@ -1116,15 +1116,15 @@ dependencies = [
 
 [[package]]
 name = "greentic-interfaces-guest"
-version = "0.4.109"
+version = "0.4.112"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c3b8a5c8eec134ef5ebaa65cc48efff1718e2129009220796b6ba42cfc669b9"
+checksum = "92b4cd55f864894d3296bbcec920a13e20bd875cff2347bf6197a0e8d93d0988"
 dependencies = [
  "greentic-interfaces",
  "greentic-types",
- "wit-bindgen 0.53.1",
- "wit-bindgen-core 0.53.1",
- "wit-bindgen-rust 0.53.1",
+ "wit-bindgen 0.54.0",
+ "wit-bindgen-core 0.54.0",
+ "wit-bindgen-rust 0.54.0",
 ]
 
 [[package]]
@@ -4471,6 +4471,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wit-bindgen"
+version = "0.54.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bb00254d5051d69730ee32580b7373592f10ad786757c372f0f2c7b61f86a2c"
+dependencies = [
+ "wit-bindgen-rust-macro 0.54.0",
+]
+
+[[package]]
 name = "wit-bindgen-core"
 version = "0.51.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4486,6 +4495,17 @@ name = "wit-bindgen-core"
 version = "0.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3deda4b7e9f522d994906f6e6e0fc67965ea8660306940a776b76732be8f3933"
+dependencies = [
+ "anyhow",
+ "heck",
+ "wit-parser 0.245.1",
+]
+
+[[package]]
+name = "wit-bindgen-core"
+version = "0.54.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "99cdef5ccf0b0e9bf30868d6f9c5ed116c84ae95f84ba29d2216d3e922de3963"
 dependencies = [
  "anyhow",
  "heck",
@@ -4525,6 +4545,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "wit-bindgen-rust"
+version = "0.54.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e76541e2f37ac1729db85765729daa0f3c2b5975d66699114d107525f6d6c8d5"
+dependencies = [
+ "anyhow",
+ "heck",
+ "indexmap",
+ "prettyplease",
+ "syn",
+ "wasm-metadata 0.245.1",
+ "wit-bindgen-core 0.54.0",
+ "wit-component 0.245.1",
+]
+
+[[package]]
 name = "wit-bindgen-rust-macro"
 version = "0.51.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4552,6 +4588,21 @@ dependencies = [
  "syn",
  "wit-bindgen-core 0.53.1",
  "wit-bindgen-rust 0.53.1",
+]
+
+[[package]]
+name = "wit-bindgen-rust-macro"
+version = "0.54.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a284e17b2bc808c72ba008f6694626fa76bcac608b3d1ed0880f9add3f558f8e"
+dependencies = [
+ "anyhow",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "syn",
+ "wit-bindgen-core 0.54.0",
+ "wit-bindgen-rust 0.54.0",
 ]
 
 [[package]]
