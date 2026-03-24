@@ -6,14 +6,14 @@ permissions:
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    branches: [main]
     tags:
       - "v*"
 
 jobs:
   publish-crates-io:
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startswith(github.ref, 'refs/tags/v')
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/main' || startswith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
       - name: Set up Rust
