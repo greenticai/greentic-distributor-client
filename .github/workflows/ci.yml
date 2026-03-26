@@ -1,34 +1,27 @@
 name: CI
+on:
+  workflow_call:
+  push:
+    branches: [main]
+  pull_request:
+
 permissions:
   contents: read
 
-on:
-  workflow_call:
-  pull_request:
-  push:
-    branches: [main]
-
 jobs:
-  build:
+  ci:
+    uses: greenticai/.github/.github/workflows/host-crate-ci.yml@main
+    with:
+      setup-script: |
+        rg -n "greentic_interfaces::bindings::|greentic_interfaces_guest::bindings::|\bbindings::greentic::" src tests README.md \
+          && { echo "ERROR: use canonical/facade modules instead of bindings::* paths"; exit 1; } \
+          || true
+
+  package:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.91.0
-        with:
-          components: rustfmt, clippy
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-      - name: canonical interfaces guard
-        run: |
-          rg -n "greentic_interfaces::bindings::|greentic_interfaces_guest::bindings::|\bbindings::greentic::" src tests README.md \
-            && { echo "ERROR: use canonical/facade modules instead of bindings::* paths"; exit 1; } \
-            || true
-      - name: fmt
-        run: cargo fmt --all -- --check
-      - name: clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: test
-        run: cargo test --all-features
-      - name: package
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo package
         run: cargo package --locked -p greentic-distributor-client
