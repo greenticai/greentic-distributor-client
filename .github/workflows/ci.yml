@@ -12,6 +12,7 @@ jobs:
   ci:
     uses: greenticai/.github/.github/workflows/host-crate-ci.yml@main
     with:
+      run-semver-checks: true
       setup-script: |
         rg -n "greentic_interfaces::bindings::|greentic_interfaces_guest::bindings::|\bbindings::greentic::" src tests README.md \
           && { echo "ERROR: use canonical/facade modules instead of bindings::* paths"; exit 1; } \
