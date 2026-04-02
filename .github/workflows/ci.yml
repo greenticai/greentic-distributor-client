@@ -1,8 +1,11 @@
 name: CI
 on:
   workflow_call:
+  workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, develop]
+    tags:
+      - "v*"
   pull_request:
 
 permissions:
@@ -23,10 +26,131 @@ jobs:
           || true
 
   package:
+    needs: ci
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.91.0
       - uses: Swatinem/rust-cache@v2
       - name: cargo package
         run: cargo package --locked -p greentic-distributor-client
+
+  publish-crates-io:
+    name: Publish crates.io
+    needs: [ci, package]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Package check (client)
+        run: cargo package --locked -p greentic-distributor-client
+
+      - name: Publish client (skip if already uploaded)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -eo pipefail
+          set +e
+          output=$(cargo publish --locked -p greentic-distributor-client 2>&1)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ $status -ne 0 ]; then
+            if echo "$output" | grep -Eqi "already uploaded|already exists"; then
+              echo "greentic-distributor-client already published; continuing."
+            else
+              exit $status
+            fi
+          fi
+
+      - name: Package check (dev)
+        run: cargo package --locked -p greentic-distributor-dev
+
+      - name: Publish dev (skip if already uploaded)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -eo pipefail
+          set +e
+          output=$(cargo publish --locked -p greentic-distributor-dev 2>&1)
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ $status -ne 0 ]; then
+            if echo "$output" | grep -Eqi "already uploaded|already exists"; then
+              echo "greentic-distributor-dev already published; continuing."
+            else
+              exit $status
+            fi
+          fi
+
+  publish-dev-codeartifact:
+    name: Publish dev crates to CodeArtifact
+    needs: [ci, package]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get CodeArtifact Token
+        run: |
+          token=$(aws codeartifact get-authorization-token \
+            --domain ${{ secrets.CODEARTIFACT_DOMAIN }} \
+            --domain-owner ${{ secrets.CODEARTIFACT_DOMAIN_OWNER }} \
+            --region "$AWS_REGION" \
+            --query authorizationToken \
+            --output text)
+          echo "::add-mask::$token"
+          echo "CARGO_REGISTRIES_CORP_ARTIFACTS_GREENTIC_TOKEN=$token" >> $GITHUB_ENV
+
+      - name: Configure CodeArtifact Registry
+        shell: bash
+        run: |
+          set -euo pipefail
+          endpoint=$(aws codeartifact get-repository-endpoint \
+            --domain "${{ secrets.CODEARTIFACT_DOMAIN }}" \
+            --domain-owner "${{ secrets.CODEARTIFACT_DOMAIN_OWNER }}" \
+            --repository greentic \
+            --format cargo \
+            --region "$AWS_REGION" \
+            --query repositoryEndpoint \
+            --output text)
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<EOF
+          [registries.corp-artifacts-greentic]
+          index = "sparse+${endpoint}"
+          credential-provider = "cargo:token"
+          EOF
+
+      - name: Set dev version
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_version=$(grep -E '^version\s*=' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          dev_version="${base_version}-dev.${GITHUB_RUN_NUMBER}"
+          echo "Using dev version: ${dev_version}"
+          sed -i -E "0,/^version = \"[^\"]+\"/s//version = \"${dev_version}\"/" Cargo.toml
+
+      - name: Publish to CodeArtifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo publish -p greentic-distributor-client --registry corp-artifacts-greentic --allow-dirty
+          sleep 5
+          cargo publish -p greentic-distributor-dev --registry corp-artifacts-greentic --allow-dirty
