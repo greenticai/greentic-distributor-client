@@ -1,1 +1,8 @@
+.github/workflows/ci.yml
+.github/workflows/codeql.yml
+.github/workflows/codex-security-fix.yml
+.github/workflows/codex-semver-fix.yml
+.github/workflows/dependabot-automerge.yml
 .github/workflows/dependency-review.yml
+.github/workflows/dev-publish.yml
+.github/workflows/publish.yml
