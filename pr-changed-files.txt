@@ -1,16 +1,1 @@
-.github/workflows/nightly-coverage.yml
-Cargo.lock
-Cargo.toml
-benches/perf.rs
-coverage-policy.json
-src/dist.rs
-src/oci_components.rs
-src/oci_packs.rs
-src/runner_api.rs
-tests/dist_client.rs
-tests/oci_components.rs
-tests/oci_packs.rs
-tests/pack_cli_parity.rs
-tests/perf_scaling.rs
-tests/perf_support.rs
-tests/perf_timeout.rs
+.github/workflows/ci.yml
