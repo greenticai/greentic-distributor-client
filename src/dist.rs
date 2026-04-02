@@ -3823,7 +3823,14 @@ fn rollback_protected_bundle_ids(
 fn digest_for_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("sha256:{:x}", hasher.finalize())
+    let digest = hasher.finalize();
+    let mut rendered = String::with_capacity("sha256:".len() + digest.len() * 2);
+    rendered.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut rendered, "{byte:02x}");
+    }
+    rendered
 }
 
 fn trim_digest_prefix(digest: &str) -> &str {
@@ -3894,7 +3901,14 @@ fn strip_file_component_suffix(input: &str) -> String {
 fn compute_bytes_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("sha256:{:x}", hasher.finalize())
+    let digest = hasher.finalize();
+    let mut rendered = String::with_capacity("sha256:".len() + digest.len() * 2);
+    rendered.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut rendered, "{byte:02x}");
+    }
+    rendered
 }
 
 fn normalize_content_type(current: Option<&str>, fallback: &str) -> String {

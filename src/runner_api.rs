@@ -282,7 +282,13 @@ fn verify_file_digest(path: &PathBuf, expected_digest: &str) -> Result<(), Runne
         }
         hasher.update(&buf[..read]);
     }
-    let computed = format!("sha256:{:x}", hasher.finalize());
+    let digest = hasher.finalize();
+    let mut computed = String::with_capacity("sha256:".len() + digest.len() * 2);
+    computed.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut computed, "{byte:02x}");
+    }
     if computed != expected_digest {
         return Err(RunnerApiError::CacheDigestMismatch {
             expected: expected_digest.to_string(),
@@ -295,7 +301,14 @@ fn verify_file_digest(path: &PathBuf, expected_digest: &str) -> Result<(), Runne
 fn compute_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("sha256:{:x}", hasher.finalize())
+    let digest = hasher.finalize();
+    let mut rendered = String::with_capacity("sha256:".len() + digest.len() * 2);
+    rendered.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut rendered, "{byte:02x}");
+    }
+    rendered
 }
 
 fn select_layer_by_digest<'a>(

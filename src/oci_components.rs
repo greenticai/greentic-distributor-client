@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -122,7 +124,7 @@ struct ComponentManifestArtifacts {
     component_wasm: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct CacheMetadata {
     original_reference: String,
     resolved_digest: String,
@@ -384,18 +386,46 @@ fn select_layer<'a>(
             reference: reference.to_string(),
         });
     }
-    for ty in preferred_types {
-        if let Some(layer) = layers.iter().find(|l| &l.media_type == ty) {
-            return Ok(layer);
+    let mut best_idx = 0usize;
+    let mut best_rank = usize::MAX;
+    let mut last_media_type = "";
+    let mut last_rank = None;
+    for (idx, layer) in layers.iter().enumerate() {
+        let media_type = layer.media_type.as_str();
+        let rank = if media_type == last_media_type {
+            last_rank
+        } else {
+            let looked_up = preferred_types
+                .iter()
+                .position(|preferred| preferred == media_type);
+            last_media_type = media_type;
+            last_rank = looked_up;
+            looked_up
+        };
+        if let Some(rank) = rank
+            && rank < best_rank
+        {
+            best_idx = idx;
+            best_rank = rank;
+            if rank == 0 {
+                break;
+            }
         }
     }
-    Ok(&layers[0])
+    Ok(&layers[best_idx])
 }
 
 fn compute_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("sha256:{:x}", hasher.finalize())
+    let digest = hasher.finalize();
+    let mut rendered = String::with_capacity("sha256:".len() + digest.len() * 2);
+    rendered.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut rendered, "{byte:02x}");
+    }
+    rendered
 }
 
 fn normalize_digest(digest: &str) -> String {
@@ -445,14 +475,18 @@ fn manifest_component_wasm_name(
     Ok(name)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct OciCache {
     root: PathBuf,
+    metadata_cache: RwLock<HashMap<String, CacheMetadata>>,
 }
 
 impl OciCache {
     fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            metadata_cache: RwLock::new(HashMap::new()),
+        }
     }
 
     fn write_layer_data(
@@ -511,15 +545,15 @@ impl OciCache {
             manifest_wasm_name: manifest_wasm_name.map(|name| name.to_string()),
         };
         let metadata_path = dir.join("metadata.json");
-        let buf =
-            serde_json::to_vec_pretty(&metadata).map_err(|source| OciComponentError::Serde {
-                reference: reference.to_string(),
-                source,
-            })?;
+        let buf = serde_json::to_vec(&metadata).map_err(|source| OciComponentError::Serde {
+            reference: reference.to_string(),
+            source,
+        })?;
         fs::write(&metadata_path, buf).map_err(|source| OciComponentError::Io {
             reference: reference.to_string(),
             source,
         })?;
+        self.store_metadata(digest, &metadata);
 
         Ok(artifact_path)
     }
@@ -613,9 +647,14 @@ impl OciCache {
     }
 
     fn read_metadata(&self, digest: &str) -> anyhow::Result<CacheMetadata> {
+        if let Some(metadata) = self.cached_metadata(digest) {
+            return Ok(metadata);
+        }
         let metadata_path = self.metadata_path(digest);
         let bytes = fs::read(metadata_path)?;
-        Ok(serde_json::from_slice(&bytes)?)
+        let metadata = serde_json::from_slice(&bytes)?;
+        self.store_metadata(digest, &metadata);
+        Ok(metadata)
     }
 
     fn artifact_dir(&self, digest: &str) -> PathBuf {
@@ -668,6 +707,19 @@ impl OciCache {
 
     fn metadata_path(&self, digest: &str) -> PathBuf {
         self.artifact_dir(digest).join("metadata.json")
+    }
+
+    fn cached_metadata(&self, digest: &str) -> Option<CacheMetadata> {
+        self.metadata_cache
+            .read()
+            .ok()
+            .and_then(|cache| cache.get(trim_digest_prefix(digest)).cloned())
+    }
+
+    fn store_metadata(&self, digest: &str, metadata: &CacheMetadata) {
+        if let Ok(mut cache) = self.metadata_cache.write() {
+            cache.insert(trim_digest_prefix(digest).to_string(), metadata.clone());
+        }
     }
 }
 

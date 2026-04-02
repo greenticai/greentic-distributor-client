@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "global": {
+    "line_coverage_min": 60.0
+  },
+  "defaults": {
+    "per_file_line_coverage_min": 60.0
+  },
+  "exclusions": {
+    "files": [
+      "src/bin/greentic-dist.rs",
+      "src/bin/greentic-distributor-client.rs",
+      "src/dist_cli.rs",
+      "src/runner_api.rs",
+      "src/wit_client.rs"
+    ]
+  },
+  "per_file": {
+    "src/oci_components.rs": {
+      "line_coverage_min": 78.0
+    },
+    "src/dist.rs": {
+      "line_coverage_min": 65.0
+    },
+    "src/store_auth.rs": {
+      "line_coverage_min": 70.0
+    }
+  }
+}
