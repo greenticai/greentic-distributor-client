@@ -16,13 +16,14 @@ Validation from repository artifacts:
 
 Result:
 - No Dependabot vulnerabilities detected.
-- No CodeQL/code-scanning vulnerabilities detected.
+- No code scanning vulnerabilities detected.
 
 ## 2) Remediation Actions
 - No actionable security findings were present.
 - No dependency updates were required.
 - No source-code fixes were required.
+- No security-related code changes were applied.
 
 ## 3) Final Status
 - Security review completed successfully for this CI run.
-- Repository code was not modified for security remediation because no vulnerabilities were reported.
+- Repository remains unchanged for remediation because no vulnerabilities were reported.
