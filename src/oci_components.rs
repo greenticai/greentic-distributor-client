@@ -34,6 +34,7 @@ static DEFAULT_ACCEPTED_MANIFEST_TYPES: &[&str] = &[
 ];
 
 const COMPONENT_MANIFEST_MEDIA_TYPE: &str = "application/vnd.greentic.component.manifest+json";
+const COMPONENT_MANIFEST_CBOR_MEDIA_TYPE: &str = "application/vnd.greentic.component.manifest+cbor";
 const DEFAULT_WASM_FILENAME: &str = "component.wasm";
 
 /// Preferred component layer media types.
@@ -41,6 +42,7 @@ static DEFAULT_LAYER_MEDIA_TYPES: &[&str] = &[
     "application/vnd.wasm.component.v1+wasm",
     "application/vnd.module.wasm.content.layer.v1+wasm",
     "application/wasm",
+    COMPONENT_MANIFEST_CBOR_MEDIA_TYPE,
     COMPONENT_MANIFEST_MEDIA_TYPE,
     "application/octet-stream",
 ];
@@ -324,12 +326,23 @@ impl<C: RegistryClient> OciComponentResolver<C> {
             &self.opts.preferred_layer_media_types,
             reference,
         )?;
+        // Prefer CBOR manifest layer (auto-generated from describe()) over JSON.
         let manifest_layer = image
             .layers
             .iter()
-            .find(|layer| layer.media_type == COMPONENT_MANIFEST_MEDIA_TYPE);
+            .find(|layer| layer.media_type == COMPONENT_MANIFEST_CBOR_MEDIA_TYPE)
+            .or_else(|| {
+                image
+                    .layers
+                    .iter()
+                    .find(|layer| layer.media_type == COMPONENT_MANIFEST_MEDIA_TYPE)
+            });
         let manifest_wasm_name = if let Some(layer) = manifest_layer {
-            manifest_component_wasm_name(&layer.data, reference)?
+            if layer.media_type == COMPONENT_MANIFEST_CBOR_MEDIA_TYPE {
+                manifest_component_wasm_name_cbor(&layer.data, reference)?
+            } else {
+                manifest_component_wasm_name(&layer.data, reference)?
+            }
         } else {
             None
         };
@@ -361,8 +374,12 @@ impl<C: RegistryClient> OciComponentResolver<C> {
         if let Some(layer) = manifest_layer
             && layer.media_type != chosen_layer.media_type
         {
-            self.cache
-                .write_manifest_layer(&resolved_digest, &layer.data, reference)?;
+            self.cache.write_manifest_layer(
+                &resolved_digest,
+                &layer.media_type,
+                &layer.data,
+                reference,
+            )?;
         }
 
         Ok(ResolvedComponent {
@@ -458,6 +475,37 @@ fn manifest_component_wasm_name(
             reference: reference.to_string(),
             source,
         })?;
+    validate_manifest_wasm_name(manifest, reference)
+}
+
+/// Extract the component WASM filename from CBOR-encoded manifest data.
+fn manifest_component_wasm_name_cbor(
+    data: &[u8],
+    reference: &str,
+) -> Result<Option<String>, OciComponentError> {
+    const MAX_MANIFEST_SIZE: usize = 64 * 1024; // 64KB
+    if data.len() > MAX_MANIFEST_SIZE {
+        return Err(OciComponentError::ManifestParseCbor {
+            reference: reference.to_string(),
+            reason: format!(
+                "manifest too large: {} bytes (max {})",
+                data.len(),
+                MAX_MANIFEST_SIZE
+            ),
+        });
+    }
+    let manifest: ComponentManifest =
+        ciborium::from_reader(data).map_err(|e| OciComponentError::ManifestParseCbor {
+            reference: reference.to_string(),
+            reason: e.to_string(),
+        })?;
+    validate_manifest_wasm_name(manifest, reference)
+}
+
+fn validate_manifest_wasm_name(
+    manifest: ComponentManifest,
+    reference: &str,
+) -> Result<Option<String>, OciComponentError> {
     let name = manifest
         .artifacts
         .and_then(|artifacts| artifacts.component_wasm)
@@ -519,7 +567,9 @@ impl OciCache {
         manifest_digest: Option<String>,
         manifest_wasm_name: Option<&str>,
     ) -> Result<PathBuf, OciComponentError> {
-        let artifact_path = if media_type == COMPONENT_MANIFEST_MEDIA_TYPE {
+        let artifact_path = if media_type == COMPONENT_MANIFEST_MEDIA_TYPE
+            || media_type == COMPONENT_MANIFEST_CBOR_MEDIA_TYPE
+        {
             self.write_layer_data(digest, media_type, data, reference)?
         } else if let Some(name) = manifest_wasm_name {
             let path = self.write_named_file(digest, name, data, reference)?;
@@ -581,10 +631,11 @@ impl OciCache {
     fn write_manifest_layer(
         &self,
         digest: &str,
+        media_type: &str,
         data: &[u8],
         reference: &str,
     ) -> Result<PathBuf, OciComponentError> {
-        self.write_layer_data(digest, COMPONENT_MANIFEST_MEDIA_TYPE, data, reference)
+        self.write_layer_data(digest, media_type, data, reference)
     }
 
     fn try_hit(&self, digest: &str, reference: &str) -> Option<ResolvedComponent> {
@@ -670,6 +721,8 @@ impl OciCache {
         let dir = self.artifact_dir(digest);
         let filename = if media_type == COMPONENT_MANIFEST_MEDIA_TYPE {
             "component.manifest.json"
+        } else if media_type == COMPONENT_MANIFEST_CBOR_MEDIA_TYPE {
+            "component.manifest.cbor"
         } else if let Some(name) = manifest_wasm_name {
             name
         } else {
@@ -679,14 +732,23 @@ impl OciCache {
     }
 
     fn manifest_wasm_name_from_cache(&self, digest: &str, reference: &str) -> Option<String> {
-        let path = self.artifact_dir(digest).join("component.manifest.json");
-        if !path.exists() {
-            return None;
+        let dir = self.artifact_dir(digest);
+        // Prefer CBOR manifest (auto-generated from describe()) over JSON.
+        let cbor_path = dir.join("component.manifest.cbor");
+        if cbor_path.exists() {
+            let data = fs::read(cbor_path).ok()?;
+            return manifest_component_wasm_name_cbor(&data, reference)
+                .ok()
+                .flatten();
         }
-        let data = fs::read(path).ok()?;
-        manifest_component_wasm_name(&data, reference)
-            .ok()
-            .flatten()
+        let json_path = dir.join("component.manifest.json");
+        if json_path.exists() {
+            let data = fs::read(json_path).ok()?;
+            return manifest_component_wasm_name(&data, reference)
+                .ok()
+                .flatten();
+        }
+        None
     }
 
     fn write_legacy_symlink(&self, dir: &Path, target: &str) {
@@ -1028,6 +1090,70 @@ mod tests {
             Some("component_templates.wasm")
         );
     }
+
+    #[test]
+    fn cbor_manifest_extracts_wasm_name() {
+        let manifest = serde_json::json!({
+            "artifacts": {"component_wasm": "my-component.wasm"},
+            "id": "test"
+        });
+        let mut cbor_bytes = Vec::new();
+        ciborium::into_writer(&manifest, &mut cbor_bytes).unwrap();
+
+        let result = manifest_component_wasm_name_cbor(&cbor_bytes, "test-ref").unwrap();
+
+        assert_eq!(result.as_deref(), Some("my-component.wasm"));
+    }
+
+    #[test]
+    fn corrupt_cbor_returns_parse_error() {
+        let garbage = b"\xff\xfe\xfd\x00\x01\x02";
+
+        let result = manifest_component_wasm_name_cbor(garbage, "bad-ref");
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, OciComponentError::ManifestParseCbor { .. }),
+            "expected ManifestParseCbor, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_cbor_rejected() {
+        let oversized = vec![0u8; 64 * 1024 + 1];
+
+        let result = manifest_component_wasm_name_cbor(&oversized, "big-ref");
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match &err {
+            OciComponentError::ManifestParseCbor { reason, .. } => {
+                assert!(
+                    reason.contains("manifest too large"),
+                    "expected 'manifest too large' in reason, got: {reason}"
+                );
+            }
+            other => panic!("expected ManifestParseCbor, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn artifact_path_maps_cbor_media_type() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = OciCache::new(temp.path().to_path_buf());
+
+        let path = cache.artifact_path_for_media_type(
+            TEST_DIGEST,
+            COMPONENT_MANIFEST_CBOR_MEDIA_TYPE,
+            None,
+        );
+
+        assert_eq!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("component.manifest.cbor")
+        );
+    }
 }
 
 fn convert_image(image: ImageData) -> PulledImage {
@@ -1096,6 +1222,8 @@ pub enum OciComponentError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("failed to parse CBOR component manifest for `{reference}`: {reason}")]
+    ManifestParseCbor { reference: String, reason: String },
     #[error("invalid component_wasm filename `{name}` in manifest for `{reference}`")]
     InvalidManifestWasmName { reference: String, name: String },
 }
