@@ -17,7 +17,7 @@ categories = ["network-programming", "wasm"]
 [features]
 default = ["dist-cli"]
 http-runtime = ["reqwest"]
-oci-components = ["dirs-next", "oci-distribution", "sha2"]
+oci-components = ["dirs-next", "oci-distribution", "sha2", "ciborium"]
 pack-fetch = ["dirs-next", "oci-distribution", "sha2"]
 runner-api = ["dirs-next", "oci-distribution", "sha2"]
 dist-client = ["oci-components", "reqwest", "pack-fetch"]
@@ -40,6 +40,7 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 anyhow = "1"
+ciborium = { version = "0.2", optional = true }
 greentic-types = { version = ">=0.4.52", features = ["schema"] }
 greentic-interfaces-guest = {  version = "0.4", features = ["distributor-api", "distributor-api-imports"] }
 greentic-config-types = "0.4"
