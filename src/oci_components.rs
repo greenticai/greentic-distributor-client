@@ -1176,6 +1176,7 @@ fn convert_image(image: ImageData) -> PulledImage {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum OciComponentError {
     #[error("invalid OCI reference `{reference}`: {reason}")]
     InvalidReference { reference: String, reason: String },
