@@ -1,4 +1,4 @@
-name: Codex Security Fix
+name: Codex Semver Fix
 on:
   pull_request:
     branches: [main]
@@ -8,23 +8,17 @@ on:
         description: "Branch to scan and patch (only for manual run)"
         required: false
         default: ""
-      max_alerts:
-        description: "Maximum open alerts per source to include"
-        required: true
-        default: "20"
 permissions:
   contents: write
   pull-requests: write
-  security-events: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  security-fix:
-    uses: greenticai/.github/.github/workflows/codex-security-fix.yml@main
+  semver-fix:
+    uses: greenticai/.github/.github/workflows/codex-semver-fix.yml@main
     with:
       branch: ${{ github.event.inputs.branch || '' }}
-      max_alerts: ${{ github.event.inputs.max_alerts || '20' }}
     secrets: inherit

@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -124,7 +126,7 @@ pub struct ResolvedPack {
     pub manifest_digest: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct CacheMetadata {
     original_reference: String,
     resolved_digest: String,
@@ -317,18 +319,38 @@ fn select_layer<'a>(
             reference: reference.to_string(),
         });
     }
-    for ty in preferred_types {
-        if let Some(layer) = layers.iter().find(|l| &l.media_type == ty) {
-            return Ok(layer);
+    let preferred_positions = preferred_types
+        .iter()
+        .enumerate()
+        .map(|(idx, media_type)| (media_type.as_str(), idx))
+        .collect::<HashMap<_, _>>();
+    let mut best_idx = 0usize;
+    let mut best_rank = usize::MAX;
+    for (idx, layer) in layers.iter().enumerate() {
+        if let Some(&rank) = preferred_positions.get(layer.media_type.as_str())
+            && rank < best_rank
+        {
+            best_idx = idx;
+            best_rank = rank;
+            if rank == 0 {
+                break;
+            }
         }
     }
-    Ok(&layers[0])
+    Ok(&layers[best_idx])
 }
 
 fn compute_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("sha256:{:x}", hasher.finalize())
+    let digest = hasher.finalize();
+    let mut rendered = String::with_capacity("sha256:".len() + digest.len() * 2);
+    rendered.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut rendered, "{byte:02x}");
+    }
+    rendered
 }
 
 fn normalize_digest(digest: &str) -> String {
@@ -352,14 +374,18 @@ pub(crate) fn default_cache_root() -> PathBuf {
     PathBuf::from(".greentic").join("cache").join("packs")
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct PackCache {
     root: PathBuf,
+    metadata_cache: RwLock<HashMap<String, CacheMetadata>>,
 }
 
 impl PackCache {
     fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            metadata_cache: RwLock::new(HashMap::new()),
+        }
     }
 
     fn write(
@@ -393,7 +419,7 @@ impl PackCache {
             manifest_digest,
         };
         let metadata_path = dir.join("metadata.json");
-        let buf = serde_json::to_vec_pretty(&metadata).map_err(|source| OciPackError::Serde {
+        let buf = serde_json::to_vec(&metadata).map_err(|source| OciPackError::Serde {
             reference: reference.to_string(),
             source,
         })?;
@@ -401,6 +427,7 @@ impl PackCache {
             reference: reference.to_string(),
             source,
         })?;
+        self.store_metadata(digest, &metadata);
 
         Ok(pack_path)
     }
@@ -426,13 +453,31 @@ impl PackCache {
     }
 
     fn read_metadata(&self, digest: &str) -> anyhow::Result<CacheMetadata> {
+        if let Some(metadata) = self.cached_metadata(digest) {
+            return Ok(metadata);
+        }
         let metadata_path = self.artifact_dir(digest).join("metadata.json");
         let bytes = fs::read(metadata_path)?;
-        Ok(serde_json::from_slice(&bytes)?)
+        let metadata = serde_json::from_slice(&bytes)?;
+        self.store_metadata(digest, &metadata);
+        Ok(metadata)
     }
 
     fn artifact_dir(&self, digest: &str) -> PathBuf {
         self.root.join(trim_digest_prefix(digest))
+    }
+
+    fn cached_metadata(&self, digest: &str) -> Option<CacheMetadata> {
+        self.metadata_cache
+            .read()
+            .ok()
+            .and_then(|cache| cache.get(trim_digest_prefix(digest)).cloned())
+    }
+
+    fn store_metadata(&self, digest: &str, metadata: &CacheMetadata) {
+        if let Ok(mut cache) = self.metadata_cache.write() {
+            cache.insert(trim_digest_prefix(digest).to_string(), metadata.clone());
+        }
     }
 }
 
@@ -472,6 +517,13 @@ pub trait RegistryClient: Send + Sync {
 #[derive(Clone)]
 pub struct DefaultRegistryClient {
     inner: Client,
+    auth: RegistryClientAuth,
+}
+
+#[derive(Clone, Debug)]
+enum RegistryClientAuth {
+    Anonymous,
+    Basic { username: String, password: String },
 }
 
 impl Default for DefaultRegistryClient {
@@ -489,6 +541,7 @@ impl RegistryClient for DefaultRegistryClient {
         };
         Self {
             inner: Client::new(config),
+            auth: RegistryClientAuth::Anonymous,
         }
     }
 
@@ -504,19 +557,30 @@ impl RegistryClient for DefaultRegistryClient {
             .iter()
             .map(|media_type| media_type.as_str())
             .collect::<Vec<_>>();
+        let auth = match &self.auth {
+            RegistryClientAuth::Anonymous => RegistryAuth::Anonymous,
+            RegistryClientAuth::Basic { username, password } => {
+                RegistryAuth::Basic(username.clone(), password.clone())
+            }
+        };
         let image = self
             .inner
-            .pull(
-                reference,
-                &RegistryAuth::Anonymous,
-                accepted_media_type_refs,
-            )
+            .pull(reference, &auth, accepted_media_type_refs)
             .await?;
         Ok(convert_image(image))
     }
 }
 
 impl DefaultRegistryClient {
+    pub fn with_basic_auth(username: impl Into<String>, password: impl Into<String>) -> Self {
+        let mut client = Self::default_client();
+        client.auth = RegistryClientAuth::Basic {
+            username: username.into(),
+            password: password.into(),
+        };
+        client
+    }
+
     async fn expand_accepted_media_types(
         &self,
         reference: &Reference,
@@ -526,10 +590,13 @@ impl DefaultRegistryClient {
             .iter()
             .map(|media_type| (*media_type).to_string())
             .collect::<Vec<_>>();
-        let (manifest, _) = self
-            .inner
-            .pull_manifest(reference, &RegistryAuth::Anonymous)
-            .await?;
+        let auth = match &self.auth {
+            RegistryClientAuth::Anonymous => RegistryAuth::Anonymous,
+            RegistryClientAuth::Basic { username, password } => {
+                RegistryAuth::Basic(username.clone(), password.clone())
+            }
+        };
+        let (manifest, _) = self.inner.pull_manifest(reference, &auth).await?;
         if let OciManifest::Image(image_manifest) = manifest {
             extend_accepted_media_types_from_layers(
                 &mut accepted,

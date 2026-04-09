@@ -192,7 +192,7 @@ The public source model supports:
 - `fixture://...` when `fixture-resolver` is enabled
 - `repo://...` and `store://...` as source kinds
 
-`repo://...` is still a placeholder mapping source kind. `store://greentic-biz/<tenant>/<package-path>` maps to `ghcr.io/greentic-biz/<package-path>` and uses credentials saved with `auth login <tenant>`.
+`repo://...` is still a placeholder mapping source kind. `store://greentic-biz/<tenant>/<package-path>` maps to `ghcr.io/greentic-biz/<package-path>` and uses credentials saved with `auth login <tenant>`. For bundles published under a namespace, use paths such as `store://greentic-biz/<tenant>/bundles/zain-x-bundle:latest`.
 
 Compatibility-only example:
 

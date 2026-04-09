@@ -21,7 +21,14 @@ use tempfile::TempDir;
 fn digest_for(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("sha256:{:x}", hasher.finalize())
+    let digest = hasher.finalize();
+    let mut rendered = String::with_capacity("sha256:".len() + digest.len() * 2);
+    rendered.push_str("sha256:");
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut rendered, "{byte:02x}");
+    }
+    rendered
 }
 
 fn options(dir: &TempDir) -> DistOptions {
@@ -1720,6 +1727,55 @@ async fn resolve_ref_injector_can_redirect_resolution() {
     let client = DistClient::with_ref_injector(options(&temp), injector);
     let resolved = client.resolve_ref("repo://redirect-me").await.unwrap();
     assert_eq!(resolved.component_id, "redirected");
+}
+
+struct OciSourceInjector;
+
+#[async_trait]
+impl ResolveRefInjector for OciSourceInjector {
+    async fn resolve(
+        &self,
+        reference: &str,
+    ) -> Result<Option<InjectedResolution>, greentic_distributor_client::dist::DistError> {
+        if reference != "oci://ghcr.io/greenticai/components/templates:latest" {
+            return Ok(None);
+        }
+
+        let wasm_bytes = b"oci-component".to_vec();
+        Ok(Some(InjectedResolution::WasmBytes {
+            resolved_digest: digest_for(&wasm_bytes),
+            wasm_bytes,
+            component_id: "templates".to_string(),
+            abi_version: None,
+            source: ArtifactSource {
+                raw_ref: reference.to_string(),
+                kind: ArtifactSourceKind::Oci,
+                transport_hints: Default::default(),
+                dev_mode: false,
+            },
+        }))
+    }
+}
+
+#[tokio::test]
+async fn resolve_ref_injector_preserves_registry_host_in_oci_canonical_ref() {
+    let temp = tempfile::tempdir().unwrap();
+    let client = DistClient::with_ref_injector(options(&temp), Arc::new(OciSourceInjector));
+
+    let reference = "oci://ghcr.io/greenticai/components/templates:latest";
+    let resolved = client.resolve_ref(reference).await.unwrap();
+
+    assert_eq!(
+        resolved.descriptor.canonical_ref,
+        format!(
+            "oci://ghcr.io/greenticai/components/templates@{}",
+            resolved.resolved_digest
+        )
+    );
+    assert_eq!(
+        resolved.source_snapshot.canonical_ref,
+        resolved.descriptor.canonical_ref
+    );
 }
 
 #[tokio::test]

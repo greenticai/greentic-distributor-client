@@ -159,7 +159,14 @@ pub async fn load_login(
 }
 
 async fn load_state(path: &Path) -> Result<Option<StoreAuthState>, StoreAuthError> {
-    let store = open_store(path)?;
+    ensure_parent_dir(path)?;
+    let store = match open_store(path) {
+        Ok(store) => store,
+        Err(StoreAuthError::SecretStore(message)) if is_missing_store_path_error(&message) => {
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+    };
     let bytes = match store.get("secrets://prod/dist/_/store/auth_state").await {
         Ok(bytes) => bytes,
         Err(err) if err.to_string().contains("not found") => return Ok(None),
@@ -203,6 +210,11 @@ fn ensure_parent_dir(path: &Path) -> Result<(), StoreAuthError> {
     Ok(())
 }
 
+fn is_missing_store_path_error(message: &str) -> bool {
+    message.contains("No such file or directory (os error 2)")
+        || message.contains("The system cannot find the path specified. (os error 3)")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,5 +251,45 @@ mod tests {
         assert_eq!(loaded.tenant, "tenant-b");
         assert_eq!(loaded.username, "tenant-b");
         assert_eq!(loaded.token, "other-secret");
+    }
+
+    #[tokio::test]
+    async fn missing_store_directory_returns_login_required_message() {
+        let temp = tempfile::tempdir().unwrap();
+        let auth_path = temp.path().join("missing").join("store-auth.json");
+        let state_path = auth_path.clone();
+
+        let err = load_login(&auth_path, &state_path, "tenant-c")
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "no saved store login found at `{}`; run `greentic-dist auth login <tenant>` first",
+                auth_path.display()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn load_login_creates_missing_parent_directory_before_opening_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let auth_dir = temp.path().join("nested").join("auth");
+        let auth_path = auth_dir.join("store-auth.json");
+        let state_path = auth_path.clone();
+
+        let err = load_login(&auth_path, &state_path, "tenant-d")
+            .await
+            .unwrap_err();
+
+        assert!(auth_dir.is_dir());
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "no saved store login found at `{}`; run `greentic-dist auth login <tenant>` first",
+                auth_path.display()
+            )
+        );
     }
 }

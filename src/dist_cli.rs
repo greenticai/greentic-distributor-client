@@ -1,4 +1,4 @@
-use crate::dist::{CachePolicy, DistClient, DistOptions, ResolvePolicy};
+use crate::dist::{CachePolicy, DistClient, DistOptions, DownloadedStoreArtifact, ResolvePolicy};
 #[cfg(feature = "pack-fetch")]
 use crate::oci_packs::{
     DefaultRegistryClient, OciPackFetcher, PackFetchOptions, RegistryClient, ResolvedPack,
@@ -50,6 +50,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: AuthCommand,
     },
+    /// Download a raw store artifact without adding it to the cache
+    Store {
+        #[command(subcommand)]
+        command: StoreCommand,
+    },
     /// Pull an OCI reference and report cached files
     Inspect {
         reference: String,
@@ -99,6 +104,20 @@ pub enum AuthCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+pub enum StoreCommand {
+    /// Download a raw artifact from store:// to a file without caching it
+    Download {
+        reference: String,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        token: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Serialize)]
 struct ResolveOutput<'a> {
     reference: &'a str,
@@ -111,6 +130,17 @@ struct PullOutput<'a> {
     digest: &'a str,
     cache_path: Option<&'a std::path::Path>,
     fetched: bool,
+}
+
+#[derive(Serialize)]
+struct StoreDownloadOutput<'a> {
+    reference: &'a str,
+    mapped_reference: &'a str,
+    canonical_ref: &'a str,
+    digest: &'a str,
+    media_type: &'a str,
+    output_path: &'a std::path::Path,
+    size_bytes: u64,
 }
 
 #[cfg(feature = "pack-fetch")]
@@ -301,6 +331,42 @@ pub async fn run_with_pack_client<C: RegistryClient>(
                 return Ok(());
             }
         },
+        Commands::Store { command } => match command {
+            StoreCommand::Download {
+                reference,
+                output,
+                token,
+                json,
+            } => {
+                let downloaded = download_store_for_cli(
+                    &client,
+                    &reference,
+                    token,
+                    &store_auth_path,
+                    &store_state_path,
+                )
+                .await?;
+                let output_path =
+                    write_store_download(&downloaded, output).map_err(|err| CliError {
+                        code: 2,
+                        message: format!("failed to write downloaded artifact: {err}"),
+                    })?;
+                if json {
+                    let out = StoreDownloadOutput {
+                        reference: &reference,
+                        mapped_reference: &downloaded.mapped_reference,
+                        canonical_ref: &downloaded.canonical_ref,
+                        digest: &downloaded.digest,
+                        media_type: &downloaded.media_type,
+                        output_path: output_path.as_path(),
+                        size_bytes: downloaded.size_bytes,
+                    };
+                    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+                } else {
+                    println!("{}", output_path.display());
+                }
+            }
+        },
         Commands::Inspect {
             reference,
             show_media_type,
@@ -309,42 +375,48 @@ pub async fn run_with_pack_client<C: RegistryClient>(
                 .pull_oci_with_details(&reference)
                 .await
                 .map_err(CliError::from_dist)?;
-            let wasm_path = inspection.cache_dir.join("component.wasm");
-            let manifest_path = inspection.cache_dir.join("component.manifest.json");
             println!("cache dir: {}", inspection.cache_dir.display());
-            println!("component.wasm: {}", wasm_path.exists());
-            println!("component.manifest.json: {}", manifest_path.exists());
-            if manifest_path.exists() {
-                let manifest_bytes = fs::read(&manifest_path).map_err(|err| CliError {
-                    code: 2,
-                    message: format!("failed to read component.manifest.json: {err}"),
-                })?;
-                let manifest: ComponentManifest =
-                    serde_json::from_slice(&manifest_bytes).map_err(|err| CliError {
+            println!("artifact type: {:?}", inspection.artifact_type);
+            if inspection.artifact_type == crate::dist::ArtifactType::Component {
+                let wasm_path = inspection.cache_dir.join("component.wasm");
+                let manifest_path = inspection.cache_dir.join("component.manifest.json");
+                println!("component.wasm: {}", wasm_path.exists());
+                println!("component.manifest.json: {}", manifest_path.exists());
+                if manifest_path.exists() {
+                    let manifest_bytes = fs::read(&manifest_path).map_err(|err| CliError {
                         code: 2,
-                        message: format!("failed to parse component.manifest.json: {err}"),
+                        message: format!("failed to read component.manifest.json: {err}"),
                     })?;
-                let component_wasm = manifest
-                    .artifacts
-                    .and_then(|a| a.component_wasm)
-                    .map(|name| name.trim().to_string())
-                    .filter(|name| !name.is_empty());
-                if let Some(component_wasm) = component_wasm {
-                    let manifest_wasm_path = inspection.cache_dir.join(&component_wasm);
-                    let exists = manifest_wasm_path.exists();
-                    println!("manifest component_wasm: {component_wasm}");
-                    println!("manifest component_wasm exists: {exists}");
-                    let mismatch = !exists;
-                    println!("manifest component_wasm mismatch: {mismatch}");
-                    if mismatch {
-                        eprintln!(
-                            "error: manifest component_wasm `{}` missing from cache",
-                            component_wasm
-                        );
+                    let manifest: ComponentManifest = serde_json::from_slice(&manifest_bytes)
+                        .map_err(|err| CliError {
+                            code: 2,
+                            message: format!("failed to parse component.manifest.json: {err}"),
+                        })?;
+                    let component_wasm = manifest
+                        .artifacts
+                        .and_then(|a| a.component_wasm)
+                        .map(|name| name.trim().to_string())
+                        .filter(|name| !name.is_empty());
+                    if let Some(component_wasm) = component_wasm {
+                        let manifest_wasm_path = inspection.cache_dir.join(&component_wasm);
+                        let exists = manifest_wasm_path.exists();
+                        println!("manifest component_wasm: {component_wasm}");
+                        println!("manifest component_wasm exists: {exists}");
+                        let mismatch = !exists;
+                        println!("manifest component_wasm mismatch: {mismatch}");
+                        if mismatch {
+                            eprintln!(
+                                "error: manifest component_wasm `{}` missing from cache",
+                                component_wasm
+                            );
+                        }
+                    } else {
+                        println!("manifest component_wasm: <missing>");
                     }
-                } else {
-                    println!("manifest component_wasm: <missing>");
                 }
+            } else {
+                println!("artifact path: {}", inspection.artifact_path.display());
+                println!("artifact exists: {}", inspection.artifact_path.exists());
             }
             if show_media_type {
                 println!("selected media type: {}", inspection.selected_media_type);
@@ -407,11 +479,144 @@ pub async fn fetch_pack_for_cli<C: RegistryClient>(
         })
 }
 
+async fn download_store_for_cli(
+    client: &DistClient,
+    reference: &str,
+    token: Option<String>,
+    store_auth_path: &std::path::Path,
+    store_state_path: &std::path::Path,
+) -> Result<DownloadedStoreArtifact, CliError> {
+    match client.download_store_artifact(reference).await {
+        Ok(downloaded) => Ok(downloaded),
+        Err(crate::dist::DistError::StoreAuth(message))
+            if is_missing_store_token_message(&message) =>
+        {
+            let tenant = tenant_from_store_reference(reference).ok_or_else(|| CliError {
+                code: 5,
+                message: message.clone(),
+            })?;
+            let token = match token {
+                Some(token) => token,
+                None => prompt_password(format!("GHCR token for tenant `{tenant}`: ")).map_err(
+                    |err| CliError {
+                        code: 10,
+                        message: format!("failed to read token: {err}"),
+                    },
+                )?,
+            };
+            save_login(store_auth_path, store_state_path, &tenant, &token)
+                .await
+                .map_err(|err| CliError {
+                    code: 5,
+                    message: err.to_string(),
+                })?;
+            client
+                .download_store_artifact(reference)
+                .await
+                .map_err(CliError::from_dist)
+        }
+        Err(err) => Err(CliError::from_dist(err)),
+    }
+}
+
+fn write_store_download(
+    downloaded: &DownloadedStoreArtifact,
+    output: Option<PathBuf>,
+) -> Result<PathBuf, std::io::Error> {
+    let path = output.unwrap_or_else(|| default_store_download_path(downloaded));
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, &downloaded.bytes)?;
+    Ok(path)
+}
+
+fn default_store_download_path(downloaded: &DownloadedStoreArtifact) -> PathBuf {
+    let mapped = downloaded
+        .mapped_reference
+        .trim_start_matches("oci://")
+        .split('@')
+        .next()
+        .unwrap_or(downloaded.mapped_reference.as_str());
+    let last_segment = mapped.rsplit('/').next().unwrap_or("store-download");
+    let stem = last_segment
+        .split(':')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or("store-download");
+    PathBuf::from(format!(
+        "{stem}{}",
+        extension_for_media_type(&downloaded.media_type)
+    ))
+}
+
+fn extension_for_media_type(media_type: &str) -> &'static str {
+    if media_type == "application/json" || media_type.ends_with("+json") {
+        ".json"
+    } else if media_type == "application/wasm" {
+        ".wasm"
+    } else if media_type.ends_with("+gzip") {
+        ".tgz"
+    } else if media_type.ends_with("+zstd") {
+        ".tar.zst"
+    } else if media_type.ends_with("+zip") {
+        ".zip"
+    } else {
+        ".bin"
+    }
+}
+
+fn tenant_from_store_reference(reference: &str) -> Option<String> {
+    let target = reference.strip_prefix("store://greentic-biz/")?;
+    let (tenant, _) = target.split_once('/')?;
+    (!tenant.trim().is_empty()).then(|| tenant.to_string())
+}
+
+fn is_missing_store_token_message(message: &str) -> bool {
+    message.contains("no saved store login") || message.contains("has no saved credentials")
+}
+
 impl CliError {
     pub fn from_dist(err: crate::dist::DistError) -> Self {
         Self {
             code: err.exit_code(),
             message: err.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plus_json_media_types_download_as_json_files() {
+        let downloaded = DownloadedStoreArtifact {
+            source_ref: "store://greentic-biz/3point/catalogs/zain-x:latest".to_string(),
+            mapped_reference: "oci://ghcr.io/greentic-biz/catalogs/zain-x:latest".to_string(),
+            canonical_ref: "oci://ghcr.io/greentic-biz/catalogs/zain-x@sha256:abc".to_string(),
+            digest: "sha256:abc".to_string(),
+            media_type: "application/vnd.greentic.zain-x.catalog.root.v1+json".to_string(),
+            bytes: br#"{"kind":"catalog-root"}"#.to_vec(),
+            size_bytes: 23,
+            manifest_digest: Some("sha256:abc".to_string()),
+        };
+
+        assert_eq!(
+            default_store_download_path(&downloaded),
+            PathBuf::from("zain-x.json")
+        );
+    }
+
+    #[test]
+    fn detects_missing_saved_store_tokens() {
+        assert!(is_missing_store_token_message(
+            "no saved store login found at `/tmp/store-auth.json`"
+        ));
+        assert!(is_missing_store_token_message(
+            "tenant `3point` has no saved credentials"
+        ));
     }
 }
