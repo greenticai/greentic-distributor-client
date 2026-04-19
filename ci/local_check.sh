@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TOOLCHAIN=${TOOLCHAIN:-1.91.0}
+TOOLCHAIN=${TOOLCHAIN:-1.95.0}
 
 run_cargo() {
   cargo +"$TOOLCHAIN" "$@"
@@ -23,4 +23,3 @@ echo ">> tests"
 export OCI_E2E=${OCI_E2E:-0}
 export OCI_E2E_REF=${OCI_E2E_REF:-ghcr.io/greenticai/components/templates:latest}
 run_cargo test --workspace --all-features
-
