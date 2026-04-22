@@ -1,7 +1,10 @@
 name: Codex Security Fix
+# Moved off pull_request onto a nightly schedule. See plans/binary-bifurcation.md
+# Phase A.4 (Wave 3). Manual runs remain available via workflow_dispatch.
+
 on:
-  pull_request:
-    branches: [main]
+  schedule:
+    - cron: "3 3 * * *"
   workflow_dispatch:
     inputs:
       branch:
@@ -23,6 +26,8 @@ concurrency:
 
 jobs:
   security-fix:
+    # Fork-PR guard kept defense-in-depth; no-op now pull_request is removed.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     uses: greenticai/.github/.github/workflows/codex-security-fix.yml@main
     with:
       branch: ${{ github.event.inputs.branch || '' }}

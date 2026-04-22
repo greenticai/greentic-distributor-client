@@ -1,5 +1,5 @@
 [workspace.package]
-version = "0.4.41"
+version = "0.5.0"
 edition = "2024"
 
 [package]
@@ -30,7 +30,7 @@ resolver = "2"
 
 [workspace.dependencies]
 tempfile = "3"
-greentic-distributor-client = { path = ".", version = "0.4" }
+greentic-distributor-client = { path = ".", version = "0.5" }
 
 [dependencies]
 async-trait = "0.1"
@@ -40,10 +40,10 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 anyhow = "1"
-greentic-types = { version = ">=0.4.52", features = ["schema"] }
-greentic-interfaces-guest = {  version = "0.4", features = ["distributor-api", "distributor-api-imports"] }
-greentic-config-types = "0.4"
-greentic-secrets-lib = { version = "0.4", features = ["providers-dev"] }
+greentic-types = { version = "0.5", features = ["schema"] }
+greentic-interfaces-guest = {  version = "0.5", features = ["distributor-api", "distributor-api-imports"] }
+greentic-config-types = "0.5"
+greentic-secrets-lib = { version = "0.5", features = ["providers-dev"] }
 semver = "1"
 oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"], optional = true }
 sha2 = { version = "0.11", optional = true }
@@ -56,7 +56,7 @@ tempfile = { workspace = true }
 assert_cmd = "2"
 flate2 = "1"
 tar = "0.4"
-criterion = "0.5"
+criterion = "0.8"
 
 [[bench]]
 name = "perf"
