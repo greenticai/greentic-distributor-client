@@ -1,7 +1,10 @@
 name: Codex Semver Fix
+# Moved off pull_request onto a nightly schedule. See plans/binary-bifurcation.md
+# Phase A.4 (Wave 3). Manual runs remain available via workflow_dispatch.
+
 on:
-  pull_request:
-    branches: [main]
+  schedule:
+    - cron: "24 3 * * *"
   workflow_dispatch:
     inputs:
       branch:
