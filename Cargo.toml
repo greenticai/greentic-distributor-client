@@ -81,7 +81,7 @@ async-trait = "0.1"
 serde_json = "1"
 thiserror = "2"
 anyhow = "1"
-greentic-config-types = ">=0.6.0-dev, <0.7.0-0"
+greentic-config-types = "0.5"
 semver = "1"
 rpassword = "7"
 
@@ -109,20 +109,20 @@ features = [
 ]
 
 [dependencies.greentic-types]
-version = ">=0.6.0-dev, <0.7.0-0"
+version = "0.5"
 features = [
     "schema",
 ]
 
 [dependencies.greentic-interfaces-guest]
-version = ">=0.6.0-dev, <0.7.0-0"
+version = "0.5"
 features = [
     "distributor-api",
     "distributor-api-imports",
 ]
 
 [dependencies.greentic-secrets-lib]
-version = ">=0.6.0-dev, <0.7.0-0"
+version = "0.5"
 features = [
     "providers-dev",
 ]
