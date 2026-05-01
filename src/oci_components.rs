@@ -34,12 +34,14 @@ static DEFAULT_ACCEPTED_MANIFEST_TYPES: &[&str] = &[
 ];
 
 const COMPONENT_MANIFEST_MEDIA_TYPE: &str = "application/vnd.greentic.component.manifest+json";
+const GREENTIC_WASM_COMPONENT_MEDIA_TYPE: &str = "application/vnd.greentic.wasm.component";
 const DEFAULT_WASM_FILENAME: &str = "component.wasm";
 
 /// Preferred component layer media types.
 static DEFAULT_LAYER_MEDIA_TYPES: &[&str] = &[
     "application/vnd.wasm.component.v1+wasm",
     "application/vnd.module.wasm.content.layer.v1+wasm",
+    GREENTIC_WASM_COMPONENT_MEDIA_TYPE,
     "application/wasm",
     COMPONENT_MANIFEST_MEDIA_TYPE,
     "application/octet-stream",
