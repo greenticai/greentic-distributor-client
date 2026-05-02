@@ -27,13 +27,15 @@ pub use dist::{
     BundleManifestSummary, BundleOpenMode, BundleOpenOutput, BundleOpenRequest, BundleOpener,
     BundleRecord, CacheEntry, CacheEntryState, CachePolicy, DistClient, DistOptions,
     DownloadedStoreArtifact, InjectedResolution, IntegrationError, IntegrationErrorCode,
-    IntegrityState, LockHint, PreliminaryDecision, ReleaseTrainDescriptor, ResolvePolicy,
-    ResolveRefInjector, ResolveRefRequest, ResolvedArtifact, ResolvedVia, RetentionDecision,
-    RetentionDisposition, RetentionEnvironment, RetentionInput, RetentionOutcome, RetentionReport,
-    RollbackAuditFields, RollbackBundleInput, RollbackBundleResult, SourceSnapshot,
-    StageAuditFields, StageBundleInput, StageBundleResult, TransportHints, VerificationCheck,
-    VerificationEnvironment, VerificationOutcome, VerificationPolicy, VerificationReport,
-    WarmAuditFields, WarmBundleInput, WarmBundleResult,
+    IntegrityState, LockHint, PreliminaryDecision, ReleaseArtifactKind, ReleaseChannel,
+    ReleaseIndex, ReleaseIndexEntry, ReleaseResolutionContext, ReleaseTrainDescriptor,
+    ResolvePolicy, ResolveRefInjector, ResolveRefRequest, ResolvedArtifact, ResolvedVia,
+    RetentionDecision, RetentionDisposition, RetentionEnvironment, RetentionInput,
+    RetentionOutcome, RetentionReport, RollbackAuditFields, RollbackBundleInput,
+    RollbackBundleResult, SourceSnapshot, StageAuditFields, StageBundleInput, StageBundleResult,
+    TransportHints, VerificationCheck, VerificationEnvironment, VerificationOutcome,
+    VerificationPolicy, VerificationReport, WarmAuditFields, WarmBundleInput, WarmBundleResult,
+    is_mutable_release_tag,
 };
 pub use error::DistributorError;
 #[cfg(feature = "http-runtime")]
