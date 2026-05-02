@@ -1,10 +1,13 @@
-use crate::dist::{CachePolicy, DistClient, DistOptions, DownloadedStoreArtifact, ResolvePolicy};
+use crate::dist::{
+    CachePolicy, DistClient, DistOptions, DownloadedStoreArtifact, ReleaseChannel,
+    ReleaseResolutionContext, ResolvePolicy,
+};
 #[cfg(feature = "pack-fetch")]
 use crate::oci_packs::{
     DefaultRegistryClient, OciPackFetcher, PackFetchOptions, RegistryClient, ResolvedPack,
 };
 use crate::store_auth::save_login;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rpassword::prompt_password;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -29,6 +32,12 @@ pub enum Commands {
     /// Resolve a reference and print its digest
     Resolve {
         reference: String,
+        /// Release version used for local release-index resolution of stable/dev/rnd tags
+        #[arg(long)]
+        release: Option<String>,
+        /// Release channel used with --release
+        #[arg(long, value_enum)]
+        channel: Option<CliReleaseChannel>,
         #[arg(long)]
         json: bool,
     },
@@ -37,6 +46,12 @@ pub enum Commands {
         reference: Option<String>,
         #[arg(long)]
         lock: Option<PathBuf>,
+        /// Release version used for local release-index resolution of stable/dev/rnd tags
+        #[arg(long)]
+        release: Option<String>,
+        /// Release channel used with --release
+        #[arg(long, value_enum)]
+        channel: Option<CliReleaseChannel>,
         #[arg(long)]
         json: bool,
     },
@@ -116,6 +131,23 @@ pub enum StoreCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum CliReleaseChannel {
+    Stable,
+    Dev,
+    Rnd,
+}
+
+impl From<CliReleaseChannel> for ReleaseChannel {
+    fn from(channel: CliReleaseChannel) -> Self {
+        match channel {
+            CliReleaseChannel::Stable => Self::Stable,
+            CliReleaseChannel::Dev => Self::Dev,
+            CliReleaseChannel::Rnd => Self::Rnd,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -199,14 +231,17 @@ pub async fn run_with_pack_client<C: RegistryClient>(
     let client = DistClient::new(opts);
 
     match cli.command {
-        Commands::Resolve { reference, json } => {
+        Commands::Resolve {
+            reference,
+            release,
+            channel,
+            json,
+        } => {
+            let release_context = release_context_from_flags(release, channel)?;
             let source = client
                 .parse_source(&reference)
                 .map_err(CliError::from_dist)?;
-            let descriptor = client
-                .resolve(source, ResolvePolicy)
-                .await
-                .map_err(CliError::from_dist)?;
+            let descriptor = resolve_for_cli(&client, source, release_context.as_ref()).await?;
             if json {
                 let out = ResolveOutput {
                     reference: &reference,
@@ -220,9 +255,19 @@ pub async fn run_with_pack_client<C: RegistryClient>(
         Commands::Pull {
             reference,
             lock,
+            release,
+            channel,
             json,
         } => {
+            let release_context = release_context_from_flags(release, channel)?;
             if let Some(lock_path) = lock {
+                if release_context.is_some() {
+                    return Err(CliError {
+                        code: 2,
+                        message: "--release is only supported when pulling a single reference"
+                            .into(),
+                    });
+                }
                 let resolved = client
                     .pull_lock(&lock_path)
                     .await
@@ -252,10 +297,7 @@ pub async fn run_with_pack_client<C: RegistryClient>(
                 let source = client
                     .parse_source(&reference)
                     .map_err(CliError::from_dist)?;
-                let descriptor = client
-                    .resolve(source, ResolvePolicy)
-                    .await
-                    .map_err(CliError::from_dist)?;
+                let descriptor = resolve_for_cli(&client, source, release_context.as_ref()).await?;
                 let resolved = client
                     .fetch(&descriptor, CachePolicy)
                     .await
@@ -452,6 +494,40 @@ pub async fn run_with_pack_client<C: RegistryClient>(
     }
 
     Ok(())
+}
+
+async fn resolve_for_cli(
+    client: &DistClient,
+    source: crate::dist::ArtifactSource,
+    release_context: Option<&ReleaseResolutionContext>,
+) -> Result<crate::dist::ArtifactDescriptor, CliError> {
+    match release_context {
+        Some(ctx) => client
+            .resolve_with_release_context(source, ResolvePolicy, ctx)
+            .await
+            .map_err(CliError::from_dist),
+        None => client
+            .resolve(source, ResolvePolicy)
+            .await
+            .map_err(CliError::from_dist),
+    }
+}
+
+fn release_context_from_flags(
+    release: Option<String>,
+    channel: Option<CliReleaseChannel>,
+) -> Result<Option<ReleaseResolutionContext>, CliError> {
+    match release {
+        Some(release) => Ok(Some(ReleaseResolutionContext {
+            release,
+            channel: channel.unwrap_or(CliReleaseChannel::Stable).into(),
+        })),
+        None if channel.is_some() => Err(CliError {
+            code: 2,
+            message: "--channel requires --release".into(),
+        }),
+        None => Ok(None),
+    }
 }
 
 #[cfg(feature = "pack-fetch")]
