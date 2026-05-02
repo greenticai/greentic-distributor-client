@@ -1171,9 +1171,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-config-types"
-version = "0.5.0"
+version = "0.5.24985614722"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57b57ff54329cc825cc37a5d3f5839b6c45fc2460ef9de12ee9d282f45f9f22e"
+checksum = "c87c4a49085be8895adf8f2679bd5e8f807eda003da46b8e66b7371be8698fee"
 dependencies = [
  "greentic-types",
  "serde",
@@ -1184,7 +1184,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-distributor-client"
-version = "0.5.0"
+version = "0.6.0-dev.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1213,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-distributor-dev"
-version = "0.5.0"
+version = "0.6.0-dev.0"
 dependencies = [
  "greentic-distributor-client",
  "tempfile",
@@ -1221,9 +1221,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-interfaces"
-version = "0.5.0"
+version = "0.5.24984591796"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2abe5ccec746bbeb0fbb291e0368096752e2ad31d5dbf70053638b12ec43c8d"
+checksum = "678af28ea8eabcb1498f842fdba49f1b1bf110c129f84152425c048b103e16f6"
 dependencies = [
  "anyhow",
  "constant_time_eq",
@@ -1239,9 +1239,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-interfaces-guest"
-version = "0.5.0"
+version = "0.5.24984591796"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6ae2fd6855448749061b052250c54b29ee8388ea6a81087ce07fdbc671e7eb7"
+checksum = "7bf46d483dd86d1b93747bf9ca4ce84378b20b29a74f9efcd4ae71fd375a8ebf"
 dependencies = [
  "greentic-interfaces",
  "greentic-types",
