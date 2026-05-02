@@ -4,10 +4,11 @@
 use async_trait::async_trait;
 use greentic_distributor_client::dist::{
     AccessMode, AdvisorySet, ArtifactSource, ArtifactSourceKind, BundleLifecycleState, CachePolicy,
-    DistClient, DistOptions, InjectedResolution, ResolvePolicy, ResolveRefInjector,
-    RetentionDecision, RetentionDisposition, RetentionEnvironment, RetentionInput,
-    RollbackBundleInput, StageBundleInput, VerificationEnvironment, VerificationPolicy,
-    WarmBundleInput,
+    DistClient, DistOptions, InjectedResolution, ReleaseChannel, ReleaseIndex, ReleaseIndexEntry,
+    ReleaseResolutionContext, ResolvePolicy, ResolveRefInjector, RetentionDecision,
+    RetentionDisposition, RetentionEnvironment, RetentionInput, RollbackBundleInput,
+    StageBundleInput, VerificationEnvironment, VerificationPolicy, WarmBundleInput,
+    is_mutable_release_tag,
 };
 use greentic_distributor_client::{
     ArtifactOpenOutput, ArtifactOpenRequest, ArtifactOpener, BundleManifestSummary, BundleOpenMode,
@@ -56,6 +57,64 @@ fn bundle_record_path(dir: &TempDir, bundle_id: &str) -> std::path::PathBuf {
     dir.path()
         .join("bundles")
         .join(format!("{}.json", bundle_id.replace(':', "__")))
+}
+
+fn release_context() -> ReleaseResolutionContext {
+    ReleaseResolutionContext {
+        release: "1.0.16".to_string(),
+        channel: ReleaseChannel::Stable,
+    }
+}
+
+fn release_index_path(dir: &TempDir, ctx: &ReleaseResolutionContext) -> std::path::PathBuf {
+    dir.path()
+        .join("release-index")
+        .join("v1")
+        .join(match &ctx.channel {
+            ReleaseChannel::Stable => "stable",
+            ReleaseChannel::Dev => "dev",
+            ReleaseChannel::Rnd => "rnd",
+        })
+        .join(format!("{}.json", ctx.release))
+}
+
+fn write_raw_release_index(dir: &TempDir, ctx: &ReleaseResolutionContext, bytes: &[u8]) {
+    let path = release_index_path(dir, ctx);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, bytes).unwrap();
+}
+
+fn write_release_index(
+    dir: &TempDir,
+    ctx: &ReleaseResolutionContext,
+    reference: &str,
+    version: &str,
+    digest: &str,
+) {
+    let path = release_index_path(dir, ctx);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let index = ReleaseIndex {
+        schema: "greentic.release-index.v1".to_string(),
+        release: ctx.release.clone(),
+        channel: ctx.channel.clone(),
+        refs: std::collections::BTreeMap::from([(
+            reference.to_string(),
+            ReleaseIndexEntry {
+                version: version.to_string(),
+                digest: digest.to_string(),
+                canonical_ref: format!(
+                    "{}@{}",
+                    reference
+                        .trim_start_matches("oci://")
+                        .rsplit_once(':')
+                        .unwrap()
+                        .0,
+                    digest
+                ),
+            },
+        )]),
+    };
+    fs::write(path, serde_json::to_vec_pretty(&index).unwrap()).unwrap();
 }
 
 #[tokio::test]
@@ -1696,6 +1755,231 @@ async fn repo_and_store_refs_use_registry_mapping_before_fetch() {
         format!("{store_err}").contains("offline"),
         "unexpected error: {store_err}"
     );
+}
+
+#[test]
+fn mutable_release_tag_detection_only_matches_release_tags() {
+    assert!(is_mutable_release_tag(
+        "oci://ghcr.io/greenticai/components/templates:stable"
+    ));
+    assert!(is_mutable_release_tag(
+        "ghcr.io/greenticai/components/templates:dev"
+    ));
+    assert!(is_mutable_release_tag(
+        "ghcr.io/greenticai/components/templates:rnd"
+    ));
+    assert!(!is_mutable_release_tag(
+        "ghcr.io/greenticai/components/templates:0.5.4"
+    ));
+    assert!(!is_mutable_release_tag(
+        "ghcr.io/greenticai/components/templates@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ));
+}
+
+#[tokio::test]
+async fn release_context_resolves_stable_from_local_index_offline() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("component.wasm");
+    fs::write(&file_path, b"release-indexed").unwrap();
+
+    let client = DistClient::new(options(&temp));
+    let cached = client
+        .ensure_cached(file_path.to_str().unwrap())
+        .await
+        .unwrap();
+    let digest = cached.resolved_digest.clone();
+    let reference = "oci://ghcr.io/greenticai/components/templates:stable";
+    let ctx = release_context();
+    write_release_index(&temp, &ctx, reference, "0.5.4", &digest);
+
+    let mut offline_opts = options(&temp);
+    offline_opts.offline = true;
+    let offline_client = DistClient::new(offline_opts);
+    let source = ArtifactSource {
+        raw_ref: reference.to_string(),
+        kind: ArtifactSourceKind::Oci,
+        transport_hints: Default::default(),
+        dev_mode: false,
+    };
+
+    let descriptor = offline_client
+        .resolve_with_release_context(source, ResolvePolicy, &ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptor.digest, digest);
+    assert_eq!(descriptor.source_kind, ArtifactSourceKind::Oci);
+    assert_eq!(descriptor.raw_ref, reference);
+    assert_eq!(
+        descriptor.canonical_ref,
+        format!("oci://ghcr.io/greenticai/components/templates@{digest}")
+    );
+}
+
+#[tokio::test]
+async fn release_context_missing_index_preserves_offline_behavior() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut opts = options(&temp);
+    opts.offline = true;
+    let client = DistClient::new(opts);
+    let ctx = release_context();
+    let reference = "oci://ghcr.io/greenticai/components/templates:stable";
+    let source = ArtifactSource {
+        raw_ref: reference.to_string(),
+        kind: ArtifactSourceKind::Oci,
+        transport_hints: Default::default(),
+        dev_mode: false,
+    };
+
+    let err = client
+        .resolve_with_release_context(source, ResolvePolicy, &ctx)
+        .await
+        .unwrap_err();
+
+    assert!(
+        format!("{err}").contains("offline"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn release_context_direct_oci_ref_helper_uses_local_index_offline() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("component.wasm");
+    fs::write(&file_path, b"release-indexed-helper").unwrap();
+
+    let client = DistClient::new(options(&temp));
+    let cached = client
+        .ensure_cached(file_path.to_str().unwrap())
+        .await
+        .unwrap();
+    let digest = cached.resolved_digest.clone();
+    let reference = "oci://ghcr.io/greenticai/components/templates:stable";
+    let ctx = release_context();
+    write_release_index(&temp, &ctx, reference, "0.5.4", &digest);
+
+    let mut offline_opts = options(&temp);
+    offline_opts.offline = true;
+    let offline_client = DistClient::new(offline_opts);
+
+    let descriptor = offline_client
+        .resolve_oci_ref_with_context(reference, &ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptor.digest, digest);
+    assert_eq!(
+        descriptor.canonical_ref,
+        format!("oci://ghcr.io/greenticai/components/templates@{digest}")
+    );
+}
+
+#[tokio::test]
+async fn release_context_indexed_digest_missing_blob_fails_offline_without_network() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("component.wasm");
+    fs::write(&file_path, b"stale-index").unwrap();
+
+    let client = DistClient::new(options(&temp));
+    let cached = client
+        .ensure_cached(file_path.to_str().unwrap())
+        .await
+        .unwrap();
+    let digest = cached.resolved_digest.clone();
+    fs::remove_file(cached.cache_path.unwrap()).unwrap();
+
+    let reference = "oci://ghcr.io/greenticai/components/templates:stable";
+    let ctx = release_context();
+    write_release_index(&temp, &ctx, reference, "0.5.4", &digest);
+
+    let mut offline_opts = options(&temp);
+    offline_opts.offline = true;
+    let offline_client = DistClient::new(offline_opts);
+
+    let err = offline_client
+        .resolve_oci_ref_with_context(reference, &ctx)
+        .await
+        .unwrap_err();
+
+    assert!(
+        format!("{err}").contains("not found"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn release_context_malformed_index_fails_offline_without_network() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut opts = options(&temp);
+    opts.offline = true;
+    let client = DistClient::new(opts);
+    let ctx = release_context();
+    let reference = "oci://ghcr.io/greenticai/components/templates:stable";
+    write_raw_release_index(&temp, &ctx, b"{not-json");
+
+    let err = client
+        .resolve_oci_ref_with_context(reference, &ctx)
+        .await
+        .unwrap_err();
+
+    assert!(
+        format!("{err}").contains("invalid lockfile"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn release_context_invalid_digest_entry_fails_offline_without_network() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut opts = options(&temp);
+    opts.offline = true;
+    let client = DistClient::new(opts);
+    let ctx = release_context();
+    let reference = "oci://ghcr.io/greenticai/components/templates:stable";
+    write_release_index(&temp, &ctx, reference, "0.5.4", "not-a-digest");
+
+    let err = client
+        .resolve_oci_ref_with_context(reference, &ctx)
+        .await
+        .unwrap_err();
+
+    assert!(
+        format!("{err}").contains("invalid digest"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn release_context_does_not_affect_digest_pinned_cache_resolution() {
+    let temp = tempfile::tempdir().unwrap();
+    let file_path = temp.path().join("component.wasm");
+    fs::write(&file_path, b"digest-pinned").unwrap();
+
+    let client = DistClient::new(options(&temp));
+    let cached = client
+        .ensure_cached(file_path.to_str().unwrap())
+        .await
+        .unwrap();
+    let digest = cached.resolved_digest.clone();
+    let ctx = release_context();
+    write_raw_release_index(&temp, &ctx, b"{not-json");
+
+    let mut offline_opts = options(&temp);
+    offline_opts.offline = true;
+    let offline_client = DistClient::new(offline_opts);
+    let source = ArtifactSource {
+        raw_ref: digest.clone(),
+        kind: ArtifactSourceKind::CacheDigest,
+        transport_hints: Default::default(),
+        dev_mode: false,
+    };
+
+    let descriptor = offline_client
+        .resolve_with_release_context(source, ResolvePolicy, &ctx)
+        .await
+        .unwrap();
+
+    assert_eq!(descriptor.digest, digest);
 }
 
 struct RedirectInjector {

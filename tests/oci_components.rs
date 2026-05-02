@@ -47,16 +47,32 @@ impl RegistryClient for MockRegistryClient {
     async fn pull(
         &self,
         reference: &Reference,
-        _accepted_manifest_types: &[&str],
+        accepted_manifest_types: &[&str],
     ) -> Result<PulledImage, OciDistributionError> {
         self.pulls.fetch_add(1, Ordering::SeqCst);
         let key = reference.whole();
-        self.images
+        let image = self
+            .images
             .lock()
             .unwrap()
             .get(&key)
             .cloned()
-            .ok_or_else(|| OciDistributionError::GenericError(Some("not found".into())))
+            .ok_or_else(|| OciDistributionError::GenericError(Some("not found".into())))?;
+        if image
+            .layers
+            .iter()
+            .all(|layer| !accepted_manifest_types.contains(&layer.media_type.as_str()))
+        {
+            return Err(OciDistributionError::GenericError(Some(format!(
+                "Incompatible layer media type: {}",
+                image
+                    .layers
+                    .first()
+                    .map(|layer| layer.media_type.as_str())
+                    .unwrap_or("<none>")
+            ))));
+        }
+        Ok(image)
     }
 }
 
@@ -190,6 +206,33 @@ async fn allows_tag_refs_when_opted_in() {
         .await
         .unwrap();
     assert_eq!(results[0].resolved_digest, digest);
+    assert!(results[0].path.exists());
+    assert_eq!(mock.pulls(), 1);
+}
+
+#[tokio::test]
+async fn accepts_legacy_greentic_wasm_component_media_type() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = b"legacy greentic component";
+    let digest = digest_for(data);
+    let reference = format!("ghcr.io/greentic/components@{digest}");
+
+    let mock = MockRegistryClient::with_image(
+        &reference,
+        pulled_image(data, "application/vnd.greentic.wasm.component", &digest),
+    );
+    let resolver = OciComponentResolver::with_client(mock.clone(), options(&temp));
+
+    let results = resolver
+        .resolve_refs(&extension(vec![&reference]))
+        .await
+        .unwrap();
+
+    assert_eq!(results[0].resolved_digest, digest);
+    assert_eq!(
+        results[0].media_type,
+        "application/vnd.greentic.wasm.component"
+    );
     assert!(results[0].path.exists());
     assert_eq!(mock.pulls(), 1);
 }

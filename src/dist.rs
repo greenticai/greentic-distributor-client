@@ -62,6 +62,12 @@ pub enum ArtifactType {
     Component,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReleaseArtifactKind {
+    Pack,
+    Component,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolvedVia {
     Direct,
@@ -268,6 +274,45 @@ pub struct ReleaseTrainDescriptor {
     pub bundle_digests: Vec<String>,
     pub required_extension_digests: Vec<String>,
     pub baseline_observer_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleaseChannel {
+    Stable,
+    Dev,
+    Rnd,
+}
+
+impl ReleaseChannel {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Dev => "dev",
+            Self::Rnd => "rnd",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseResolutionContext {
+    pub release: String,
+    pub channel: ReleaseChannel,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseIndex {
+    pub schema: String,
+    pub release: String,
+    pub channel: ReleaseChannel,
+    pub refs: std::collections::BTreeMap<String, ReleaseIndexEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseIndexEntry {
+    pub version: String,
+    pub digest: String,
+    pub canonical_ref: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1121,6 +1166,65 @@ impl DistClient {
         }
     }
 
+    async fn resolve_descriptor_from_reference_with_release_context(
+        &self,
+        reference: &str,
+        ctx: &ReleaseResolutionContext,
+    ) -> Result<ArtifactDescriptor, DistError> {
+        match classify_reference(reference)? {
+            RefKind::Oci(oci_ref) => {
+                if let Some(descriptor) = self.release_index_descriptor_for_oci_ref(
+                    &oci_ref,
+                    format!("oci://{oci_ref}"),
+                    ArtifactSourceKind::Oci,
+                    ResolvedVia::TagResolution,
+                    ctx,
+                )? {
+                    return Ok(descriptor);
+                }
+            }
+            RefKind::Repo(target) => {
+                if let Some(mapped) =
+                    map_registry_target(&target, self.opts.repo_registry_base.as_deref())
+                    && let Some(descriptor) = self.release_index_descriptor_for_oci_ref(
+                        &mapped,
+                        format!("repo://{target}"),
+                        ArtifactSourceKind::Repo,
+                        ResolvedVia::RepoMapping,
+                        ctx,
+                    )?
+                {
+                    return Ok(descriptor);
+                }
+            }
+            RefKind::Store(target) => {
+                let mapped = if is_greentic_biz_store_target(&target) {
+                    parse_greentic_biz_store_target(&target)
+                        .ok()
+                        .map(|parsed| parsed.mapped_reference)
+                } else {
+                    map_registry_target(&target, self.opts.store_registry_base.as_deref())
+                };
+                if let Some(mapped) = mapped
+                    && let Some(descriptor) = self.release_index_descriptor_for_oci_ref(
+                        &mapped,
+                        format!("store://{target}"),
+                        ArtifactSourceKind::Store,
+                        ResolvedVia::StoreMapping,
+                        ctx,
+                    )?
+                {
+                    return Ok(descriptor);
+                }
+            }
+            RefKind::Digest(_) | RefKind::Http(_) | RefKind::File(_) => {}
+            #[cfg(feature = "fixture-resolver")]
+            RefKind::Fixture(_) => {}
+        }
+
+        self.resolve_descriptor_from_reference(reference).await
+    }
+
     async fn resolve_oci_descriptor(
         &self,
         reference: &str,
@@ -1176,6 +1280,131 @@ impl DistClient {
             cache_dir: self.opts.cache_dir.join("legacy-packs"),
             ..Default::default()
         }
+    }
+
+    fn release_index_path(&self, ctx: &ReleaseResolutionContext) -> Result<PathBuf, DistError> {
+        if ctx.release.trim().is_empty()
+            || Path::new(&ctx.release).components().count() != 1
+            || ctx.release.contains(std::path::MAIN_SEPARATOR)
+        {
+            return Err(DistError::InvalidInput(
+                "release context release must be a single path segment".to_string(),
+            ));
+        }
+        Ok(self
+            .opts
+            .cache_dir
+            .join("release-index")
+            .join("v1")
+            .join(ctx.channel.as_str())
+            .join(format!("{}.json", ctx.release)))
+    }
+
+    fn read_release_index(
+        &self,
+        ctx: &ReleaseResolutionContext,
+    ) -> Result<Option<ReleaseIndex>, DistError> {
+        let path = self.release_index_path(ctx)?;
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(DistError::CacheError {
+                    path: path.display().to_string(),
+                    source,
+                });
+            }
+        };
+        let index = serde_json::from_slice::<ReleaseIndex>(&bytes)?;
+        if index.schema != "greentic.release-index.v1"
+            || index.release != ctx.release
+            || index.channel != ctx.channel
+        {
+            return Err(DistError::InvalidInput(
+                "release index does not match requested release context".to_string(),
+            ));
+        }
+        Ok(Some(index))
+    }
+
+    fn release_index_descriptor_for_oci_ref(
+        &self,
+        reference: &str,
+        raw_ref: String,
+        source_kind: ArtifactSourceKind,
+        resolved_via: ResolvedVia,
+        ctx: &ReleaseResolutionContext,
+    ) -> Result<Option<ArtifactDescriptor>, DistError> {
+        if !is_mutable_release_tag(reference) {
+            return Ok(None);
+        }
+
+        let descriptor = match self.try_release_index_descriptor_for_oci_ref(
+            reference,
+            &raw_ref,
+            source_kind,
+            resolved_via,
+            ctx,
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(err) if self.opts.offline => return Err(err),
+            Err(_) => None,
+        };
+        Ok(descriptor)
+    }
+
+    fn try_release_index_descriptor_for_oci_ref(
+        &self,
+        reference: &str,
+        raw_ref: &str,
+        source_kind: ArtifactSourceKind,
+        resolved_via: ResolvedVia,
+        ctx: &ReleaseResolutionContext,
+    ) -> Result<Option<ArtifactDescriptor>, DistError> {
+        let index = match self.read_release_index(ctx)? {
+            Some(index) => index,
+            None => return Ok(None),
+        };
+        let prefixed_reference = format!("oci://{reference}");
+        let Some(entry) = index
+            .refs
+            .get(reference)
+            .or_else(|| index.refs.get(&prefixed_reference))
+        else {
+            return Ok(None);
+        };
+        let digest = normalize_digest(&entry.digest);
+        if !is_digest(&digest) {
+            return Err(DistError::InvalidInput(format!(
+                "release index entry for `{reference}` has invalid digest `{}`",
+                entry.digest
+            )));
+        }
+
+        let canonical_ref = normalize_release_index_canonical_ref(&entry.canonical_ref);
+        let canonical_digest = digest_from_canonical_ref(&canonical_ref).ok_or_else(|| {
+            DistError::InvalidInput(format!(
+                "release index entry for `{reference}` is not digest-pinned"
+            ))
+        })?;
+        if canonical_digest != digest {
+            return Err(DistError::InvalidInput(format!(
+                "release index entry for `{reference}` digest does not match canonical ref"
+            )));
+        }
+
+        let mut descriptor = descriptor_from_entry(&self.stat_cache(&digest)?);
+        self.cache
+            .existing_component(&digest)
+            .ok_or_else(|| DistError::NotFound {
+                reference: digest.clone(),
+            })?;
+        descriptor.source_kind = source_kind;
+        descriptor.raw_ref = raw_ref.to_string();
+        descriptor.canonical_ref = canonical_ref;
+        descriptor.digest = digest;
+        descriptor.resolved_via = resolved_via;
+        Ok(Some(descriptor))
     }
 
     async fn load_store_credentials(&self, tenant: &str) -> Result<StoreCredentials, DistError> {
@@ -1320,13 +1549,16 @@ impl DistClient {
         Ok(descriptor)
     }
 
-    async fn pull_oci_with_source_and_client(
+    async fn pull_oci_with_source_and_client<C>(
         &self,
         reference: &str,
         source: LegacyArtifactSource,
         component_id: String,
-        client: ComponentRegistryClient,
-    ) -> Result<ResolvedArtifact, DistError> {
+        client: C,
+    ) -> Result<ResolvedArtifact, DistError>
+    where
+        C: crate::oci_components::RegistryClient,
+    {
         if self.opts.offline {
             return Err(DistError::Offline {
                 reference: reference.to_string(),
@@ -1380,13 +1612,17 @@ impl DistClient {
         Ok(resolved)
     }
 
-    async fn pull_oci_pack_with_source_and_client(
+    async fn pull_oci_pack_with_source_and_client<C>(
         &self,
         reference: &str,
         source: LegacyArtifactSource,
         component_id: String,
-        client: PackRegistryClient,
-    ) -> Result<ResolvedArtifact, DistError> {
+        client: C,
+        artifact_type: ArtifactType,
+    ) -> Result<ResolvedArtifact, DistError>
+    where
+        C: crate::oci_packs::RegistryClient,
+    {
         if self.opts.offline {
             return Err(DistError::Offline {
                 reference: reference.to_string(),
@@ -1422,7 +1658,7 @@ impl DistClient {
             resolved.fetched_from_network,
             source,
         );
-        artifact.descriptor.artifact_type = ArtifactType::Bundle;
+        artifact.descriptor.artifact_type = artifact_type;
         artifact.descriptor.media_type = resolved.media_type;
         artifact.descriptor.manifest_digest = resolved.manifest_digest;
         self.persist_cache_entry(&artifact)?;
@@ -1516,6 +1752,51 @@ impl DistClient {
         Err(DistError::InvalidInput(
             "too many injected redirect hops".to_string(),
         ))
+    }
+
+    pub async fn resolve_with_release_context(
+        &self,
+        source: ArtifactSource,
+        _policy: ResolvePolicy,
+        ctx: &ReleaseResolutionContext,
+    ) -> Result<ArtifactDescriptor, DistError> {
+        let mut current = source.raw_ref.clone();
+        for _ in 0..8 {
+            if let Some(injected) = &self.injected
+                && let Some(result) = injected.resolve(&current).await?
+            {
+                if let InjectedResolution::Redirect(next) = result {
+                    current = next;
+                    continue;
+                }
+                let artifact = self.materialize_injected(result)?;
+                return Ok(artifact.descriptor);
+            }
+
+            return self
+                .resolve_descriptor_from_reference_with_release_context(&current, ctx)
+                .await;
+        }
+        Err(DistError::InvalidInput(
+            "too many injected redirect hops".to_string(),
+        ))
+    }
+
+    pub async fn resolve_oci_ref_with_context(
+        &self,
+        reference: &str,
+        ctx: &ReleaseResolutionContext,
+    ) -> Result<ArtifactDescriptor, DistError> {
+        let source = self.parse_source(reference)?;
+        match &source.kind {
+            ArtifactSourceKind::Oci | ArtifactSourceKind::Repo | ArtifactSourceKind::Store => {
+                self.resolve_with_release_context(source, ResolvePolicy, ctx)
+                    .await
+            }
+            _ => Err(DistError::InvalidInput(
+                "release-context resolution requires an OCI, repo, or store reference".to_string(),
+            )),
+        }
     }
 
     pub fn parse_source(&self, reference: &str) -> Result<ArtifactSource, DistError> {
@@ -2020,6 +2301,61 @@ impl DistClient {
             })
     }
 
+    pub async fn prefetch_release_artifact(
+        &self,
+        kind: ReleaseArtifactKind,
+        oci_ref: &str,
+        cache_policy: CachePolicy,
+    ) -> Result<ResolvedArtifact, DistError> {
+        self.prefetch_release_artifact_with_clients(
+            kind,
+            oci_ref,
+            cache_policy,
+            ComponentRegistryClient::default(),
+            PackRegistryClient::default(),
+        )
+        .await
+    }
+
+    async fn prefetch_release_artifact_with_clients<C, P>(
+        &self,
+        kind: ReleaseArtifactKind,
+        oci_ref: &str,
+        _cache_policy: CachePolicy,
+        component_client: C,
+        pack_client: P,
+    ) -> Result<ResolvedArtifact, DistError>
+    where
+        C: crate::oci_components::RegistryClient,
+        P: crate::oci_packs::RegistryClient,
+    {
+        let reference = oci_reference_for_prefetch(oci_ref)?;
+        let source = LegacyArtifactSource::Oci(reference.clone());
+        match kind {
+            ReleaseArtifactKind::Component => {
+                let component_id = component_id_from_ref(&RefKind::Oci(reference.clone()));
+                self.pull_oci_with_source_and_client(
+                    &reference,
+                    source,
+                    component_id,
+                    component_client,
+                )
+                .await
+            }
+            ReleaseArtifactKind::Pack => {
+                let component_id = component_id_from_ref(&RefKind::Oci(reference.clone()));
+                self.pull_oci_pack_with_source_and_client(
+                    &reference,
+                    source,
+                    component_id,
+                    pack_client,
+                    ArtifactType::Pack,
+                )
+                .await
+            }
+        }
+    }
+
     pub async fn pull_lock(&self, lock_path: &Path) -> Result<Vec<ResolvedArtifact>, DistError> {
         let contents = fs::read_to_string(lock_path).map_err(|source| DistError::CacheError {
             path: lock_path.display().to_string(),
@@ -2394,6 +2730,7 @@ impl DistClient {
                         LegacyArtifactSource::Store(format!("store://{target}")),
                         target.to_string(),
                         self.greentic_biz_store_pack_client(&parsed.tenant).await?,
+                        ArtifactType::Bundle,
                     )
                     .await
                 }
@@ -3033,9 +3370,48 @@ fn artifact_source_from_reference(
     })
 }
 
+fn oci_reference_for_prefetch(reference: &str) -> Result<String, DistError> {
+    match classify_reference(reference)? {
+        RefKind::Oci(oci_ref) => Ok(oci_ref),
+        _ => Err(DistError::InvalidInput(
+            "release artifact prefetch requires an OCI reference".to_string(),
+        )),
+    }
+}
+
 fn canonical_oci_ref(reference: &str, digest: &str) -> String {
     let repo = canonical_oci_component_id(reference);
     format!("oci://{repo}@{digest}")
+}
+
+pub fn is_mutable_release_tag(reference: &str) -> bool {
+    let raw = reference.trim_start_matches("oci://");
+    if raw.contains('@') {
+        return false;
+    }
+    let Some(colon) = raw.rfind(':') else {
+        return false;
+    };
+    if let Some(slash) = raw.rfind('/')
+        && colon < slash
+    {
+        return false;
+    }
+    matches!(&raw[colon + 1..], "stable" | "dev" | "rnd")
+}
+
+fn normalize_release_index_canonical_ref(reference: &str) -> String {
+    if reference.starts_with("oci://") {
+        reference.to_string()
+    } else {
+        format!("oci://{reference}")
+    }
+}
+
+fn digest_from_canonical_ref(reference: &str) -> Option<String> {
+    let digest = reference.rsplit_once('@')?.1;
+    let digest = normalize_digest(digest);
+    is_digest(&digest).then_some(digest)
 }
 
 fn digest_from_component_dir(dir: &Path) -> Option<String> {
@@ -4314,7 +4690,247 @@ fn parse_lockfile(data: &str) -> Result<Vec<LockResolvedEntry>, serde_json::Erro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oci_components::{
+        PulledImage as ComponentPulledImage, PulledLayer as ComponentPulledLayer,
+    };
+    use crate::oci_packs::{PulledImage as PackPulledImage, PulledLayer as PackPulledLayer};
     use oci_distribution::manifest::{OciDescriptor, OciImageManifest};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    fn test_dist_options(temp: &tempfile::TempDir) -> DistOptions {
+        DistOptions {
+            cache_dir: temp.path().to_path_buf(),
+            allow_tags: true,
+            offline: false,
+            allow_insecure_local_http: true,
+            cache_max_bytes: 3 * 1024 * 1024 * 1024,
+            repo_registry_base: None,
+            store_registry_base: None,
+            store_auth_path: temp.path().join("store-auth.json"),
+            store_state_path: temp.path().join("store-auth.json"),
+            #[cfg(feature = "fixture-resolver")]
+            fixture_dir: None,
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct MockComponentRegistryClient {
+        pulls: Arc<AtomicUsize>,
+        image: Arc<Mutex<Option<ComponentPulledImage>>>,
+    }
+
+    impl MockComponentRegistryClient {
+        fn with_image(image: ComponentPulledImage) -> Self {
+            Self {
+                image: Arc::new(Mutex::new(Some(image))),
+                ..Self::default()
+            }
+        }
+
+        fn pulls(&self) -> usize {
+            self.pulls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl crate::oci_components::RegistryClient for MockComponentRegistryClient {
+        fn default_client() -> Self {
+            Self::default()
+        }
+
+        async fn pull(
+            &self,
+            _reference: &Reference,
+            _accepted_manifest_types: &[&str],
+        ) -> Result<ComponentPulledImage, OciDistributionError> {
+            self.pulls.fetch_add(1, Ordering::SeqCst);
+            self.image
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| OciDistributionError::GenericError(Some("not found".to_string())))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct MockPackRegistryClient {
+        pulls: Arc<AtomicUsize>,
+        image: Arc<Mutex<Option<PackPulledImage>>>,
+    }
+
+    impl MockPackRegistryClient {
+        fn with_image(image: PackPulledImage) -> Self {
+            Self {
+                image: Arc::new(Mutex::new(Some(image))),
+                ..Self::default()
+            }
+        }
+
+        fn pulls(&self) -> usize {
+            self.pulls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl crate::oci_packs::RegistryClient for MockPackRegistryClient {
+        fn default_client() -> Self {
+            Self::default()
+        }
+
+        async fn pull(
+            &self,
+            _reference: &Reference,
+            _accepted_manifest_types: &[&str],
+        ) -> Result<PackPulledImage, OciDistributionError> {
+            self.pulls.fetch_add(1, Ordering::SeqCst);
+            self.image
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| OciDistributionError::GenericError(Some("not found".to_string())))
+        }
+    }
+
+    #[tokio::test]
+    async fn prefetch_release_pack_accepts_tar_gzip_and_writes_pack_cache_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let client = DistClient::new(test_dist_options(&temp));
+        let reference = "ghcr.io/greenticai/greentic-packs/webchat:0.5.4";
+        let payload = b"pack-tar-gzip";
+        let digest = compute_bytes_digest(payload);
+        let pack_registry = MockPackRegistryClient::with_image(PackPulledImage {
+            digest: Some(digest.clone()),
+            layers: vec![PackPulledLayer {
+                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                data: payload.to_vec(),
+                digest: Some(digest.clone()),
+            }],
+        });
+        let component_registry = MockComponentRegistryClient::default();
+
+        let resolved = client
+            .prefetch_release_artifact_with_clients(
+                ReleaseArtifactKind::Pack,
+                reference,
+                CachePolicy,
+                component_registry.clone(),
+                pack_registry.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(pack_registry.pulls(), 1);
+        assert_eq!(component_registry.pulls(), 0);
+        assert_eq!(resolved.descriptor.digest, digest);
+        assert_eq!(resolved.descriptor.artifact_type, ArtifactType::Pack);
+        assert_eq!(
+            resolved.descriptor.media_type,
+            "application/vnd.oci.image.layer.v1.tar+gzip"
+        );
+        let entry = client.stat_cache(&digest).unwrap();
+        assert_eq!(entry.state, CacheEntryState::Ready);
+        assert_eq!(entry.artifact_type, ArtifactType::Pack);
+        assert_eq!(fs::read(&entry.local_path).unwrap(), payload);
+        let cached = client.open_cached(&digest).unwrap();
+        assert_eq!(cached.descriptor.artifact_type, ArtifactType::Pack);
+    }
+
+    #[tokio::test]
+    async fn prefetch_release_component_writes_component_cache_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let client = DistClient::new(test_dist_options(&temp));
+        let reference = "ghcr.io/greenticai/components/secrets-provider-inmemory:0.4.26";
+        let payload = b"\0asmcomponent";
+        let digest = compute_bytes_digest(payload);
+        let component_registry = MockComponentRegistryClient::with_image(ComponentPulledImage {
+            digest: Some(digest.clone()),
+            layers: vec![ComponentPulledLayer {
+                media_type: "application/vnd.greentic.wasm.component".to_string(),
+                data: payload.to_vec(),
+                digest: Some(digest.clone()),
+            }],
+        });
+        let pack_registry = MockPackRegistryClient::default();
+
+        let resolved = client
+            .prefetch_release_artifact_with_clients(
+                ReleaseArtifactKind::Component,
+                reference,
+                CachePolicy,
+                component_registry.clone(),
+                pack_registry.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(component_registry.pulls(), 1);
+        assert_eq!(pack_registry.pulls(), 0);
+        assert_eq!(resolved.descriptor.digest, digest);
+        assert_eq!(resolved.descriptor.artifact_type, ArtifactType::Component);
+        assert_eq!(
+            resolved.descriptor.media_type,
+            "application/vnd.greentic.wasm.component"
+        );
+        let entry = client.stat_cache(&digest).unwrap();
+        assert_eq!(entry.state, CacheEntryState::Ready);
+        assert_eq!(entry.artifact_type, ArtifactType::Component);
+        assert_eq!(fs::read(&entry.local_path).unwrap(), payload);
+        let cached = client.open_cached(&digest).unwrap();
+        assert_eq!(cached.descriptor.artifact_type, ArtifactType::Component);
+    }
+
+    #[tokio::test]
+    async fn prefetch_release_pack_respects_offline_tag_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut opts = test_dist_options(&temp);
+        opts.offline = true;
+        let client = DistClient::new(opts);
+        let pack_registry = MockPackRegistryClient::default();
+        let component_registry = MockComponentRegistryClient::default();
+
+        let err = client
+            .prefetch_release_artifact_with_clients(
+                ReleaseArtifactKind::Pack,
+                "ghcr.io/greenticai/greentic-packs/webchat:stable",
+                CachePolicy,
+                component_registry.clone(),
+                pack_registry.clone(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, DistError::Offline { .. }));
+        assert_eq!(pack_registry.pulls(), 0);
+        assert_eq!(component_registry.pulls(), 0);
+    }
+
+    #[tokio::test]
+    async fn prefetch_release_component_respects_tag_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut opts = test_dist_options(&temp);
+        opts.allow_tags = false;
+        let client = DistClient::new(opts);
+        let component_registry = MockComponentRegistryClient::default();
+        let pack_registry = MockPackRegistryClient::default();
+
+        let err = client
+            .prefetch_release_artifact_with_clients(
+                ReleaseArtifactKind::Component,
+                "ghcr.io/greenticai/greentic-components/card-renderer:stable",
+                CachePolicy,
+                component_registry.clone(),
+                pack_registry.clone(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("digest pin required"));
+        assert_eq!(component_registry.pulls(), 0);
+        assert_eq!(pack_registry.pulls(), 0);
+    }
 
     #[test]
     fn component_id_prefers_metadata_then_manifest_then_fallback() {
