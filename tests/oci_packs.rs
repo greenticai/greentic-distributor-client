@@ -429,9 +429,36 @@ async fn fetches_targzip_bundle_and_downstream_can_open_it() {
     );
 }
 
+#[tokio::test]
+async fn accepts_greentic_gtpack_tar_layer_media_type_by_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = b"gtpack-tar";
+    let digest = digest_for(data);
+    let reference =
+        format!("ghcr.io/greenticai/packs/deployer/greentic.fixture.helm.gtpack@{digest}");
+
+    let image = pulled_image(
+        data,
+        "application/vnd.greentic.gtpack.layer.v1+tar",
+        &digest,
+    );
+    let mock = MockRegistryClient::with_image(&reference, image);
+    let fetcher = OciPackFetcher::with_client(mock.clone(), options(&temp));
+
+    let resolved = fetcher.fetch_pack_to_cache(&reference).await.unwrap();
+
+    assert_eq!(
+        resolved.media_type,
+        "application/vnd.greentic.gtpack.layer.v1+tar"
+    );
+    assert_eq!(std::fs::read(&resolved.path).unwrap(), data);
+    assert_eq!(mock.pulls(), 1);
+}
+
 #[test]
 fn default_pack_media_types_cover_current_exact_allowlist() {
     let media_types = default_pack_layer_media_types();
+    assert!(media_types.contains(&"application/vnd.greentic.gtpack.layer.v1+tar".to_string()));
     assert!(media_types.contains(&"application/vnd.oci.image.layer.v1.tar".to_string()));
     assert!(media_types.contains(&"application/vnd.oci.image.layer.v1.tar+gzip".to_string()));
     assert!(media_types.contains(&"application/vnd.oci.image.layer.v1.tar+zstd".to_string()));
