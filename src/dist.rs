@@ -4,6 +4,7 @@ use crate::oci_components::{
 };
 use crate::oci_packs::{
     DefaultRegistryClient as PackRegistryClient, OciPackFetcher, PackFetchOptions,
+    default_pack_layer_media_types,
 };
 use crate::store_auth::{
     StoreCredentials, default_store_auth_path, default_store_state_path, load_login,
@@ -1229,15 +1230,45 @@ impl DistClient {
         &self,
         reference: &str,
     ) -> Result<ArtifactDescriptor, DistError> {
-        self.resolve_oci_descriptor_with_client(reference, ComponentRegistryClient::default())
-            .await
+        self.resolve_oci_descriptor_with_clients(
+            reference,
+            ComponentRegistryClient::default(),
+            PackRegistryClient::default(),
+        )
+        .await
     }
 
-    async fn resolve_oci_descriptor_with_client(
+    async fn resolve_oci_descriptor_with_clients<C, P>(
         &self,
         reference: &str,
-        client: ComponentRegistryClient,
-    ) -> Result<ArtifactDescriptor, DistError> {
+        component_client: C,
+        pack_client: P,
+    ) -> Result<ArtifactDescriptor, DistError>
+    where
+        C: crate::oci_components::RegistryClient,
+        P: crate::oci_packs::RegistryClient,
+    {
+        match self
+            .resolve_oci_component_descriptor_with_client(reference, component_client)
+            .await
+        {
+            Ok(descriptor) => Ok(descriptor),
+            Err(DistError::Oci(err)) if should_retry_store_as_pack(&err) => {
+                self.resolve_oci_pack_descriptor_with_client(reference, pack_client)
+                    .await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn resolve_oci_component_descriptor_with_client<C>(
+        &self,
+        reference: &str,
+        client: C,
+    ) -> Result<ArtifactDescriptor, DistError>
+    where
+        C: crate::oci_components::RegistryClient,
+    {
         let resolver = OciComponentResolver::with_client(client, self.oci_resolve_options());
         let resolved = resolver
             .resolve_descriptor(reference)
@@ -1489,11 +1520,14 @@ impl DistClient {
         .await
     }
 
-    async fn resolve_oci_pack_descriptor_with_client(
+    async fn resolve_oci_pack_descriptor_with_client<C>(
         &self,
         reference: &str,
-        client: PackRegistryClient,
-    ) -> Result<ArtifactDescriptor, DistError> {
+        client: C,
+    ) -> Result<ArtifactDescriptor, DistError>
+    where
+        C: crate::oci_packs::RegistryClient,
+    {
         let fetcher = OciPackFetcher::with_client(client, self.oci_pack_options());
         let resolved = fetcher
             .fetch_pack_to_cache(reference)
@@ -1525,24 +1559,14 @@ impl DistClient {
         target: &str,
     ) -> Result<ArtifactDescriptor, DistError> {
         let parsed = parse_greentic_biz_store_target(target)?;
-        let mut descriptor = match self
-            .resolve_oci_descriptor_with_client(
+        let mut descriptor = self
+            .resolve_oci_descriptor_with_clients(
                 &parsed.mapped_reference,
                 self.greentic_biz_store_component_client(&parsed.tenant)
                     .await?,
+                self.greentic_biz_store_pack_client(&parsed.tenant).await?,
             )
-            .await
-        {
-            Ok(descriptor) => descriptor,
-            Err(DistError::Oci(err)) if should_retry_store_as_pack(&err) => {
-                self.resolve_oci_pack_descriptor_with_client(
-                    &parsed.mapped_reference,
-                    self.greentic_biz_store_pack_client(&parsed.tenant).await?,
-                )
-                .await?
-            }
-            Err(err) => return Err(err),
-        };
+            .await?;
         descriptor.source_kind = ArtifactSourceKind::Store;
         descriptor.raw_ref = format!("store://{target}");
         descriptor.resolved_via = ResolvedVia::StoreMapping;
@@ -2123,11 +2147,11 @@ impl DistClient {
             ArtifactSourceKind::Https => self.fetch_http(raw).await?,
             ArtifactSourceKind::File => self.ingest_file(Path::new(raw)).await?,
             ArtifactSourceKind::Oci => {
-                let reference = descriptor
-                    .canonical_ref
-                    .trim_start_matches("oci://")
-                    .to_string();
-                self.pull_oci(&reference).await?
+                self.fetch_oci_descriptor_with_pack_client(
+                    descriptor,
+                    PackRegistryClient::default(),
+                )
+                .await?
             }
             ArtifactSourceKind::Repo => {
                 self.resolve_repo_ref(raw.trim_start_matches("repo://"))
@@ -2160,6 +2184,33 @@ impl DistClient {
             });
         }
         Ok(artifact)
+    }
+
+    async fn fetch_oci_descriptor_with_pack_client<C>(
+        &self,
+        descriptor: &ArtifactDescriptor,
+        pack_client: C,
+    ) -> Result<ResolvedArtifact, DistError>
+    where
+        C: crate::oci_packs::RegistryClient,
+    {
+        let reference = descriptor
+            .canonical_ref
+            .trim_start_matches("oci://")
+            .to_string();
+        match descriptor.artifact_type {
+            ArtifactType::Component => self.pull_oci(&reference).await,
+            ArtifactType::Pack | ArtifactType::Bundle => {
+                self.pull_oci_pack_with_source_and_client(
+                    &reference,
+                    LegacyArtifactSource::Oci(reference.clone()),
+                    component_id_from_ref(&RefKind::Oci(reference.clone())),
+                    pack_client,
+                    descriptor.artifact_type.clone(),
+                )
+                .await
+            }
+        }
     }
 
     pub fn open_cached(&self, digest_or_cache_key: &str) -> Result<ResolvedArtifact, DistError> {
@@ -4472,17 +4523,28 @@ fn accepted_store_download_media_types(manifest: &OciManifest) -> Vec<String> {
         "application/octet-stream".to_string(),
         WASM_CONTENT_TYPE.to_string(),
     ];
+    extend_unique_media_types(&mut accepted, default_pack_layer_media_types());
     if let OciManifest::Image(image_manifest) = manifest {
-        for layer in &image_manifest.layers {
-            if !accepted
+        extend_unique_media_types(
+            &mut accepted,
+            image_manifest
+                .layers
                 .iter()
-                .any(|candidate| candidate == &layer.media_type)
-            {
-                accepted.push(layer.media_type.clone());
-            }
-        }
+                .map(|layer| layer.media_type.clone()),
+        );
     }
     accepted
+}
+
+fn extend_unique_media_types<I>(accepted: &mut Vec<String>, media_types: I)
+where
+    I: IntoIterator<Item = String>,
+{
+    for media_type in media_types {
+        if !accepted.iter().any(|candidate| candidate == &media_type) {
+            accepted.push(media_type);
+        }
+    }
 }
 
 fn select_store_download_layer<'a>(
@@ -4694,7 +4756,7 @@ mod tests {
         PulledImage as ComponentPulledImage, PulledLayer as ComponentPulledLayer,
     };
     use crate::oci_packs::{PulledImage as PackPulledImage, PulledLayer as PackPulledLayer};
-    use oci_distribution::manifest::{OciDescriptor, OciImageManifest};
+    use oci_distribution::manifest::{OciDescriptor, OciImageIndex, OciImageManifest};
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -4752,6 +4814,38 @@ mod tests {
                 .unwrap()
                 .clone()
                 .ok_or_else(|| OciDistributionError::GenericError(Some("not found".to_string())))
+        }
+    }
+
+    #[derive(Clone)]
+    struct RejectingComponentRegistryClient {
+        message: String,
+    }
+
+    impl Default for RejectingComponentRegistryClient {
+        fn default() -> Self {
+            Self {
+                message:
+                    "Incompatible layer media type: application/vnd.greentic.gtpack.layer.v1+tar"
+                        .to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::oci_components::RegistryClient for RejectingComponentRegistryClient {
+        fn default_client() -> Self {
+            Self::default()
+        }
+
+        async fn pull(
+            &self,
+            _reference: &Reference,
+            _accepted_manifest_types: &[&str],
+        ) -> Result<ComponentPulledImage, OciDistributionError> {
+            Err(OciDistributionError::GenericError(Some(
+                self.message.clone(),
+            )))
         }
     }
 
@@ -4836,6 +4930,84 @@ mod tests {
         assert_eq!(fs::read(&entry.local_path).unwrap(), payload);
         let cached = client.open_cached(&digest).unwrap();
         assert_eq!(cached.descriptor.artifact_type, ArtifactType::Pack);
+    }
+
+    #[tokio::test]
+    async fn generic_oci_resolve_retries_gtpack_tar_as_pack_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let client = DistClient::new(test_dist_options(&temp));
+        let reference = "ghcr.io/greenticai/packs/deployer/greentic.fixture.helm.gtpack:0.4.59";
+        let payload = b"pack-tar";
+        let digest = compute_bytes_digest(payload);
+        let pack_registry = MockPackRegistryClient::with_image(PackPulledImage {
+            digest: Some(digest.clone()),
+            layers: vec![PackPulledLayer {
+                media_type: "application/vnd.greentic.gtpack.layer.v1+tar".to_string(),
+                data: payload.to_vec(),
+                digest: Some(digest.clone()),
+            }],
+        });
+
+        let descriptor = client
+            .resolve_oci_descriptor_with_clients(
+                reference,
+                RejectingComponentRegistryClient::default(),
+                pack_registry.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(pack_registry.pulls(), 1);
+        assert_eq!(descriptor.artifact_type, ArtifactType::Bundle);
+        assert_eq!(descriptor.digest, digest);
+        assert_eq!(
+            descriptor.media_type,
+            "application/vnd.greentic.gtpack.layer.v1+tar"
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_oci_resolve_then_fetch_uses_pack_fetcher_for_gtpack_tar() {
+        let temp = tempfile::tempdir().unwrap();
+        let client = DistClient::new(test_dist_options(&temp));
+        let reference = "ghcr.io/greenticai/packs/deployer/greentic.fixture.helm.gtpack:0.4.59";
+        let payload = b"pack-tar";
+        let digest = compute_bytes_digest(payload);
+        let resolved_pack = PackPulledImage {
+            digest: Some(digest.clone()),
+            layers: vec![PackPulledLayer {
+                media_type: "application/vnd.greentic.gtpack.layer.v1+tar".to_string(),
+                data: payload.to_vec(),
+                digest: Some(digest.clone()),
+            }],
+        };
+        let resolve_pack_registry = MockPackRegistryClient::with_image(resolved_pack.clone());
+        let fetch_pack_registry = MockPackRegistryClient::with_image(resolved_pack);
+
+        let descriptor = client
+            .resolve_oci_descriptor_with_clients(
+                reference,
+                RejectingComponentRegistryClient::default(),
+                resolve_pack_registry.clone(),
+            )
+            .await
+            .unwrap();
+        let fetch_temp = tempfile::tempdir().unwrap();
+        let fetch_client = DistClient::new(test_dist_options(&fetch_temp));
+        let artifact = fetch_client
+            .fetch_oci_descriptor_with_pack_client(&descriptor, fetch_pack_registry.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(resolve_pack_registry.pulls(), 1);
+        assert_eq!(fetch_pack_registry.pulls(), 1);
+        assert_eq!(artifact.descriptor.artifact_type, ArtifactType::Bundle);
+        assert_eq!(
+            artifact.descriptor.media_type,
+            "application/vnd.greentic.gtpack.layer.v1+tar"
+        );
+        assert_eq!(artifact.descriptor.digest, digest);
+        assert_eq!(fs::read(&artifact.local_path).unwrap(), payload);
     }
 
     #[tokio::test]
@@ -5024,6 +5196,21 @@ mod tests {
         assert!(media_type_is_json(
             "application/vnd.greentic.zain-x.catalog.root.v1+json"
         ));
+    }
+
+    #[test]
+    fn store_download_uses_pack_media_type_allowlist_for_non_image_manifests() {
+        let accepted =
+            accepted_store_download_media_types(&OciManifest::ImageIndex(OciImageIndex {
+                schema_version: 2,
+                media_type: None,
+                manifests: Vec::new(),
+                annotations: None,
+            }));
+
+        assert!(accepted.contains(&"application/vnd.greentic.gtpack.layer.v1+tar".to_string()));
+        assert!(accepted.contains(&"application/vnd.greentic.gtpack.v1+zip".to_string()));
+        assert!(accepted.contains(&WASM_CONTENT_TYPE.to_string()));
     }
 
     #[tokio::test]
