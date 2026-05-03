@@ -4795,16 +4795,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prefetch_release_pack_accepts_tar_gzip_and_writes_pack_cache_entry() {
+    async fn prefetch_release_pack_accepts_gtpack_tar_and_writes_pack_cache_entry() {
         let temp = tempfile::tempdir().unwrap();
         let client = DistClient::new(test_dist_options(&temp));
-        let reference = "ghcr.io/greenticai/greentic-packs/webchat:0.5.4";
+        let reference = "ghcr.io/greenticai/packs/deployer/greentic.fixture.helm.gtpack:0.4.59";
         let payload = b"pack-tar-gzip";
         let digest = compute_bytes_digest(payload);
         let pack_registry = MockPackRegistryClient::with_image(PackPulledImage {
             digest: Some(digest.clone()),
             layers: vec![PackPulledLayer {
-                media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                media_type: "application/vnd.greentic.gtpack.layer.v1+tar".to_string(),
                 data: payload.to_vec(),
                 digest: Some(digest.clone()),
             }],
@@ -4828,7 +4828,7 @@ mod tests {
         assert_eq!(resolved.descriptor.artifact_type, ArtifactType::Pack);
         assert_eq!(
             resolved.descriptor.media_type,
-            "application/vnd.oci.image.layer.v1.tar+gzip"
+            "application/vnd.greentic.gtpack.layer.v1+tar"
         );
         let entry = client.stat_cache(&digest).unwrap();
         assert_eq!(entry.state, CacheEntryState::Ready);
