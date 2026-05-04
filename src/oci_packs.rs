@@ -37,6 +37,7 @@ const PACK_LAYER_MEDIA_TYPE: &str = "application/vnd.greentic.pack+json";
 const PACK_LAYER_MEDIA_TYPE_ZIP: &str = "application/vnd.greentic.gtpack.v1+zip";
 const PACK_LAYER_MEDIA_TYPE_ZIP_LEGACY: &str = "application/vnd.greentic.gtpack+zip";
 const PACK_LAYER_MEDIA_TYPE_PACK_ZIP: &str = "application/vnd.greentic.pack+zip";
+const PACK_LAYER_MEDIA_TYPE_GTPACK_TAR: &str = "application/vnd.greentic.gtpack.layer.v1+tar";
 const PACK_LAYER_MEDIA_TYPE_MARKDOWN: &str = "text/markdown";
 const PACK_LAYER_MEDIA_TYPE_OCTET_STREAM: &str = "application/octet-stream";
 const PACK_LAYER_MEDIA_TYPE_JSON: &str = "application/json";
@@ -96,6 +97,7 @@ pub fn default_pack_layer_media_types() -> Vec<String> {
         PACK_LAYER_MEDIA_TYPE_ZIP.to_string(),
         PACK_LAYER_MEDIA_TYPE_ZIP_LEGACY.to_string(),
         PACK_LAYER_MEDIA_TYPE_PACK_ZIP.to_string(),
+        PACK_LAYER_MEDIA_TYPE_GTPACK_TAR.to_string(),
         PACK_LAYER_MEDIA_TYPE_MARKDOWN.to_string(),
         PACK_LAYER_MEDIA_TYPE_OCTET_STREAM.to_string(),
         PACK_LAYER_MEDIA_TYPE_JSON.to_string(),
@@ -643,6 +645,9 @@ mod tests {
             "application/vnd.greentic.zain-x.bundle.v1+tar"
         ));
         assert!(is_generic_tarball_media_type(
+            "application/vnd.greentic.gtpack.layer.v1+tar"
+        ));
+        assert!(is_generic_tarball_media_type(
             "application/vnd.greentic.zain-x.bundle.v1+tar+gzip"
         ));
         assert!(is_generic_tarball_media_type(
@@ -658,11 +663,15 @@ mod tests {
         let mut accepted = default_pack_layer_media_types();
         extend_accepted_media_types_from_layers(
             &mut accepted,
-            ["application/vnd.greentic.zain-x.bundle.v1+tar+gzip"],
+            [
+                "application/vnd.greentic.zain-x.bundle.v1+tar+gzip",
+                "application/vnd.greentic.gtpack.layer.v1+tar",
+            ],
         );
         assert!(
             accepted.contains(&"application/vnd.greentic.zain-x.bundle.v1+tar+gzip".to_string())
         );
+        assert!(accepted.contains(&"application/vnd.greentic.gtpack.layer.v1+tar".to_string()));
     }
 }
 
