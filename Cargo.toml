@@ -10,7 +10,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.6.0-dev.0"
+version = "1.1.0-dev.0"
 edition = "2024"
 
 [workspace.dependencies]
@@ -18,7 +18,7 @@ tempfile = "3"
 
 [workspace.dependencies.greentic-distributor-client]
 path = "."
-version = ">=0.6.0-dev, <0.7.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 
 [package]
 name = "greentic-distributor-client"
@@ -81,7 +81,7 @@ async-trait = "0.1"
 serde_json = "1"
 thiserror = "2"
 anyhow = "1"
-greentic-config-types = "0.5"
+greentic-config-types = ">=1.1.0-dev, <1.2.0-0"
 semver = "1"
 rpassword = "7"
 
@@ -109,20 +109,20 @@ features = [
 ]
 
 [dependencies.greentic-types]
-version = "0.5"
+version = ">=1.1.0-dev, <1.2.0-0"
 features = [
     "schema",
 ]
 
 [dependencies.greentic-interfaces-guest]
-version = "0.5"
+version = ">=1.1.0-dev, <1.2.0-0"
 features = [
     "distributor-api",
     "distributor-api-imports",
 ]
 
 [dependencies.greentic-secrets-lib]
-version = "0.5"
+version = ">=1.1.0-dev, <1.2.0-0"
 features = [
     "providers-dev",
 ]
