@@ -31,7 +31,14 @@ jobs:
         uses: cargo-bins/cargo-binstall@main
 
       - name: Install coverage toolchain binaries
-        run: cargo binstall --no-confirm cargo-nextest cargo-llvm-cov greentic-dev
+        run: |
+          # Force-reinstall every binstall target: Swatinem/rust-cache restores
+          # ~/.cargo/.crates2.json (binstall's tracking) but does not always
+          # restore the binary itself, leaving binstall to skip install while
+          # the binary is missing from PATH. --force sidesteps that.
+          cargo binstall --no-confirm --force cargo-nextest cargo-llvm-cov
+          cargo binstall --no-confirm --force greentic-dev
+          greentic-dev --version
 
       - name: Run coverage policy checks
         run: greentic-dev coverage
