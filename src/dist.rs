@@ -467,13 +467,65 @@ pub struct BundleRecord {
     pub lifecycle_state: BundleLifecycleState,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Lifecycle states a cached bundle moves through.
+///
+/// Mirrors `greentic_deploy_spec::RevisionLifecycle`; A5 extends the local
+/// enum with `Failed` and `Archived` so the cache record can carry the full
+/// matrix without forcing every distributor-client consumer to depend on the
+/// deploy-spec crate. The valid-transition matrix is enforced by
+/// [`is_valid_transition`] and gated at [`DistClient::set_bundle_state`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BundleLifecycleState {
     Inactive,
     Staged,
     Warming,
     Ready,
     Draining,
+    /// Set by health gates (B9) or runtime when a stage/warm step fails.
+    /// May be retried via `Staged` or terminated via `Archived`.
+    Failed,
+    /// Terminal: a revision archived from the cache record. Reachable from
+    /// `Staged`, `Warming`, `Ready`, and `Failed`. No outbound transitions.
+    Archived,
+}
+
+impl BundleLifecycleState {
+    /// Pure predicate mirroring `greentic_deploy_spec::is_valid_transition`
+    /// for the 14 legal edges of the lifecycle matrix.
+    ///
+    /// ```text
+    /// inactive → staged | failed
+    /// staged   → warming | failed | archived
+    /// warming  → ready | failed | archived
+    /// ready    → draining | failed | archived
+    /// draining → inactive
+    /// failed   → staged (retry) | archived
+    /// archived → (terminal)
+    /// ```
+    ///
+    /// Same-state self-transitions are rejected: `set_bundle_state` is an
+    /// observable mutation, and a no-op write would still rewrite the record
+    /// atomically and bump on-disk mtime in ways that surprise consumers.
+    pub fn is_valid_transition(from: BundleLifecycleState, to: BundleLifecycleState) -> bool {
+        use BundleLifecycleState::*;
+        matches!(
+            (from, to),
+            (Inactive, Staged)
+                | (Inactive, Failed)
+                | (Staged, Warming)
+                | (Staged, Failed)
+                | (Staged, Archived)
+                | (Warming, Ready)
+                | (Warming, Failed)
+                | (Warming, Archived)
+                | (Ready, Draining)
+                | (Ready, Failed)
+                | (Ready, Archived)
+                | (Draining, Inactive)
+                | (Failed, Staged)
+                | (Failed, Archived)
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2121,12 +2173,32 @@ impl DistClient {
             })
     }
 
+    /// Update a bundle's `lifecycle_state` after validating the transition
+    /// against the spec matrix ([`BundleLifecycleState::is_valid_transition`]).
+    ///
+    /// Persistence is atomic — A5 replaces the previous bare `fs::write`
+    /// with a tempfile → flush → sync_all → persist (+ parent fsync on unix)
+    /// pipeline so a torn write cannot leave an invalid lifecycle on disk.
+    ///
+    /// Errors:
+    /// - [`DistError::InvalidLifecycleTransition`] when the requested
+    ///   transition is not on the matrix. The on-disk record is left
+    ///   untouched.
+    /// - [`DistError::CacheError`] / [`DistError::NotFound`] on storage or
+    ///   record-lookup failures.
     pub fn set_bundle_state(
         &self,
         bundle_id: &str,
         lifecycle_state: BundleLifecycleState,
     ) -> Result<BundleRecord, DistError> {
         let mut record = self.stat_bundle(bundle_id)?;
+        if !BundleLifecycleState::is_valid_transition(record.lifecycle_state, lifecycle_state) {
+            return Err(DistError::InvalidLifecycleTransition {
+                bundle_id: bundle_id.to_string(),
+                from: record.lifecycle_state,
+                to: lifecycle_state,
+            });
+        }
         record.lifecycle_state = lifecycle_state;
         self.persist_bundle_record(&record)?;
         Ok(record)
@@ -3050,6 +3122,14 @@ pub enum DistError {
     Pack(String),
     #[error("invalid lockfile: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error(
+        "invalid lifecycle transition for bundle `{bundle_id}`: `{from:?}` → `{to:?}` is not on the matrix"
+    )]
+    InvalidLifecycleTransition {
+        bundle_id: String,
+        from: BundleLifecycleState,
+        to: BundleLifecycleState,
+    },
 }
 
 impl DistError {
@@ -3058,6 +3138,7 @@ impl DistError {
             DistError::InvalidRef { .. }
             | DistError::InvalidInput(_)
             | DistError::InsecureUrl { .. }
+            | DistError::InvalidLifecycleTransition { .. }
             | DistError::Serde(_) => 2,
             DistError::NotFound { .. } => 3,
             DistError::Offline { .. } => 4,
@@ -3161,6 +3242,22 @@ impl IntegrationError {
                 summary: format!("invalid serialized input: {source}"),
                 retryable: false,
                 details: None,
+            },
+            DistError::InvalidLifecycleTransition {
+                bundle_id,
+                from,
+                to,
+            } => Self {
+                code: IntegrationErrorCode::PolicyInputInvalid,
+                summary: format!(
+                    "invalid lifecycle transition for bundle `{bundle_id}`: `{from:?}` → `{to:?}`"
+                ),
+                retryable: false,
+                details: Some(serde_json::json!({
+                    "bundle_id": bundle_id,
+                    "from": format!("{from:?}"),
+                    "to": format!("{to:?}"),
+                })),
             },
         }
     }
@@ -3307,12 +3404,9 @@ impl ComponentCache {
 
     fn write_bundle_record(&self, record: &BundleRecord) -> Result<(), std::io::Error> {
         let path = self.bundle_record_path(&record.bundle_id);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let bytes = serde_json::to_vec_pretty(record)
             .map_err(|err| std::io::Error::other(err.to_string()))?;
-        fs::write(path, bytes)
+        atomic_write_bytes(&path, &bytes)
     }
 
     fn read_bundle_record(&self, bundle_id: &str) -> Result<BundleRecord, std::io::Error> {
@@ -3394,6 +3488,41 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Write `bytes` to `path` atomically.
+///
+/// Pipeline (mirrors `greentic-deployer::environment::atomic_write::atomic_write_bytes`):
+/// 1. `mkdir -p` the parent directory.
+/// 2. Create a `NamedTempFile` in the parent (so the rename is on the same filesystem).
+/// 3. Write the bytes and `flush` + `sync_all` the tempfile handle.
+/// 4. `persist` (atomic rename) onto the target path.
+/// 5. On unix, `fsync` the parent directory so the rename itself is durable.
+///
+/// A crash between step 3 and step 4 leaves the original file untouched; a
+/// crash between step 4 and step 5 leaves the new contents readable but the
+/// rename may not yet be durable across power loss. The lifecycle on-disk
+/// invariant we care about is "every successful `set_bundle_state` returns
+/// a record that survives a crash", which steps 1-4 guarantee.
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let parent_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent_dir)?;
+    {
+        use std::io::Write;
+        tmp.as_file_mut().write_all(bytes)?;
+        tmp.as_file_mut().flush()?;
+        tmp.as_file_mut().sync_all()?;
+    }
+    tmp.persist(path)
+        .map_err(|err| std::io::Error::other(format!("persist tempfile: {err}")))?;
+    #[cfg(unix)]
+    if let Ok(dir) = fs::File::open(parent_dir) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 fn artifact_source_from_reference(
@@ -4747,6 +4876,116 @@ fn parse_lockfile(data: &str) -> Result<Vec<LockResolvedEntry>, serde_json::Erro
         .into_iter()
         .map(|c| c.to_resolved())
         .collect())
+}
+
+#[cfg(test)]
+mod lifecycle_matrix_tests {
+    use super::*;
+
+    /// The 14 legal edges enumerated in the doc comment of
+    /// [`BundleLifecycleState::is_valid_transition`]. Kept as a separate
+    /// const so the table-driven tests below stay in lock-step with the
+    /// implementation table.
+    const VALID_EDGES: &[(BundleLifecycleState, BundleLifecycleState)] = {
+        use BundleLifecycleState::*;
+        &[
+            (Inactive, Staged),
+            (Inactive, Failed),
+            (Staged, Warming),
+            (Staged, Failed),
+            (Staged, Archived),
+            (Warming, Ready),
+            (Warming, Failed),
+            (Warming, Archived),
+            (Ready, Draining),
+            (Ready, Failed),
+            (Ready, Archived),
+            (Draining, Inactive),
+            (Failed, Staged),
+            (Failed, Archived),
+        ]
+    };
+
+    const ALL_STATES: &[BundleLifecycleState] = {
+        use BundleLifecycleState::*;
+        &[Inactive, Staged, Warming, Ready, Draining, Failed, Archived]
+    };
+
+    #[test]
+    fn every_valid_edge_is_accepted() {
+        for (from, to) in VALID_EDGES {
+            assert!(
+                BundleLifecycleState::is_valid_transition(*from, *to),
+                "expected `{from:?} → {to:?}` to be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn self_transitions_are_rejected() {
+        for state in ALL_STATES {
+            assert!(
+                !BundleLifecycleState::is_valid_transition(*state, *state),
+                "expected self-transition `{state:?} → {state:?}` to be rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn archived_is_terminal() {
+        for state in ALL_STATES {
+            assert!(
+                !BundleLifecycleState::is_valid_transition(BundleLifecycleState::Archived, *state),
+                "expected `archived → {state:?}` to be rejected (terminal)",
+            );
+        }
+    }
+
+    #[test]
+    fn cartesian_complement_is_rejected() {
+        for from in ALL_STATES {
+            for to in ALL_STATES {
+                let on_matrix = VALID_EDGES.iter().any(|edge| edge == &(*from, *to));
+                assert_eq!(
+                    BundleLifecycleState::is_valid_transition(*from, *to),
+                    on_matrix,
+                    "matrix disagrees with predicate on `{from:?} → {to:?}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn atomic_write_creates_parent_and_persists_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("nested").join("dir").join("record.json");
+        atomic_write_bytes(&target, b"hello").unwrap();
+        let read_back = std::fs::read(&target).unwrap();
+        assert_eq!(read_back, b"hello");
+    }
+
+    #[test]
+    fn atomic_write_overwrites_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("record.json");
+        atomic_write_bytes(&target, b"v1").unwrap();
+        atomic_write_bytes(&target, b"v2-longer").unwrap();
+        let read_back = std::fs::read(&target).unwrap();
+        assert_eq!(read_back, b"v2-longer");
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_tempfile_behind() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("record.json");
+        atomic_write_bytes(&target, b"payload").unwrap();
+        // After persist, only the target file should exist in the parent.
+        let entries: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("record.json")]);
+    }
 }
 
 #[cfg(test)]
