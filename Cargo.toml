@@ -84,6 +84,7 @@ anyhow = "1"
 greentic-config-types = ">=1.1.0-dev, <1.2.0-0"
 semver = "1"
 rpassword = "7"
+tempfile = { workspace = true }
 
 [dependencies.reqwest]
 version = "0.13"
@@ -156,9 +157,6 @@ assert_cmd = "2"
 flate2 = "1"
 tar = "0.4"
 criterion = "0.8"
-
-[dev-dependencies.tempfile]
-workspace = true
 
 [[bin]]
 name = "greentic-dist"
