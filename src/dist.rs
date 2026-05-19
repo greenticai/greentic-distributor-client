@@ -491,10 +491,10 @@ pub enum BundleLifecycleState {
 
 impl BundleLifecycleState {
     /// Pure predicate mirroring `greentic_deploy_spec::is_valid_transition`
-    /// for the 14 legal edges of the lifecycle matrix.
+    /// for the 15 legal edges of the lifecycle matrix.
     ///
     /// ```text
-    /// inactive → staged | failed
+    /// inactive → staged | failed | archived
     /// staged   → warming | failed | archived
     /// warming  → ready | failed | archived
     /// ready    → draining | failed | archived
@@ -502,6 +502,11 @@ impl BundleLifecycleState {
     /// failed   → staged (retry) | archived
     /// archived → (terminal)
     /// ```
+    ///
+    /// `Inactive → Archived` closes the drain-completion loop on the
+    /// deployer side (`ready → draining → inactive → archived`); mirrored
+    /// here so the dist-client and deploy-spec matrices stay in sync per
+    /// the A5 design choice.
     ///
     /// Same-state self-transitions are rejected: `set_bundle_state` is an
     /// observable mutation, and a no-op write would still rewrite the record
@@ -512,6 +517,7 @@ impl BundleLifecycleState {
             (from, to),
             (Inactive, Staged)
                 | (Inactive, Failed)
+                | (Inactive, Archived)
                 | (Staged, Warming)
                 | (Staged, Failed)
                 | (Staged, Archived)
@@ -4882,7 +4888,7 @@ fn parse_lockfile(data: &str) -> Result<Vec<LockResolvedEntry>, serde_json::Erro
 mod lifecycle_matrix_tests {
     use super::*;
 
-    /// The 14 legal edges enumerated in the doc comment of
+    /// The 15 legal edges enumerated in the doc comment of
     /// [`BundleLifecycleState::is_valid_transition`]. Kept as a separate
     /// const so the table-driven tests below stay in lock-step with the
     /// implementation table.
@@ -4891,6 +4897,7 @@ mod lifecycle_matrix_tests {
         &[
             (Inactive, Staged),
             (Inactive, Failed),
+            (Inactive, Archived),
             (Staged, Warming),
             (Staged, Failed),
             (Staged, Archived),
