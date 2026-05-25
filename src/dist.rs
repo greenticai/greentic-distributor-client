@@ -6,10 +6,13 @@ use crate::oci_packs::{
     DefaultRegistryClient as PackRegistryClient, OciPackFetcher, PackFetchOptions,
     default_pack_layer_media_types,
 };
+use crate::signing::{TrustRoot, TrustedKey, verify_artifact_dsse};
 use crate::store_auth::{
     StoreCredentials, default_store_auth_path, default_store_state_path, load_login,
 };
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use oci_distribution::Reference;
 use oci_distribution::client::{Client, ClientConfig, ClientProtocol};
 use oci_distribution::errors::OciDistributionError;
@@ -27,6 +30,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const WASM_CONTENT_TYPE: &str = "application/wasm";
+/// Descriptor annotation carrying a base64(std)-encoded DSSE envelope (C2). The
+/// publisher sets it; the verifier decodes and checks it against the trust root.
+const DSSE_ANNOTATION_KEY: &str = "dev.greentic.dsse";
 static LAST_USED_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 const CACHE_FORMAT_VERSION: u32 = 1;
@@ -232,6 +238,11 @@ pub enum VerificationEnvironment {
 pub struct VerificationPolicy {
     pub require_signature: bool,
     pub trusted_issuers: Vec<String>,
+    /// Ed25519 public keys trusted to sign artifacts (C2). A non-empty set is
+    /// the trust root the DSSE verifier checks signatures against; an empty set
+    /// means no key is trusted, so any present signature is untrusted.
+    #[serde(default)]
+    pub trusted_keys: Vec<TrustedKey>,
     pub deny_issuers: Vec<String>,
     pub deny_digests: Vec<String>,
     pub allowed_media_types: Vec<String>,
@@ -245,6 +256,7 @@ impl Default for VerificationPolicy {
         Self {
             require_signature: false,
             trusted_issuers: Vec::new(),
+            trusted_keys: Vec::new(),
             deny_issuers: Vec::new(),
             deny_digests: Vec::new(),
             allowed_media_types: Vec::new(),
@@ -2486,6 +2498,20 @@ impl DistClient {
     }
 
     pub async fn pull_lock(&self, lock_path: &Path) -> Result<Vec<ResolvedArtifact>, DistError> {
+        self.pull_lock_verified(lock_path, &VerificationPolicy::default())
+            .await
+    }
+
+    /// Like [`pull_lock`](Self::pull_lock), but verifies the DSSE signature of
+    /// every lock entry against `verification_policy`'s trust root. An untrusted
+    /// or invalid signature — or, when `require_signature` is set, a missing one
+    /// — aborts the pull in staging/prod; in dev it degrades to a warning so the
+    /// default [`pull_lock`](Self::pull_lock) path stays non-fatal.
+    pub async fn pull_lock_verified(
+        &self,
+        lock_path: &Path,
+        verification_policy: &VerificationPolicy,
+    ) -> Result<Vec<ResolvedArtifact>, DistError> {
         let contents = fs::read_to_string(lock_path).map_err(|source| DistError::CacheError {
             path: lock_path.display().to_string(),
             source,
@@ -2524,6 +2550,15 @@ impl DistClient {
                 let descriptor = self.resolve(source, ResolvePolicy).await?;
                 self.fetch(&descriptor, CachePolicy).await?
             };
+            verify_lock_entry_signature(
+                entry
+                    .reference
+                    .as_deref()
+                    .unwrap_or(&resolved_item.descriptor.digest),
+                &resolved_item.descriptor.digest,
+                entry.signature.as_deref(),
+                verification_policy,
+            )?;
             resolved.push(resolved_item);
         }
         Ok(resolved)
@@ -3106,6 +3141,8 @@ pub enum DistError {
     Network(String),
     #[error("corrupt artifact `{reference}`: {reason}")]
     CorruptArtifact { reference: String, reason: String },
+    #[error("signature verification failed for `{reference}`: {reason}")]
+    SignatureVerificationFailed { reference: String, reason: String },
     #[error("unsupported abi `{abi}`")]
     UnsupportedAbi { abi: String },
     #[error("cache error at `{path}`: {source}")]
@@ -3192,6 +3229,12 @@ impl IntegrationError {
             DistError::CorruptArtifact { reference, reason } => Self {
                 code: IntegrationErrorCode::CacheCorrupt,
                 summary: format!("corrupt artifact `{reference}`: {reason}"),
+                retryable: false,
+                details: Some(serde_json::json!({ "reference": reference, "reason": reason })),
+            },
+            DistError::SignatureVerificationFailed { reference, reason } => Self {
+                code: IntegrationErrorCode::SignatureRequired,
+                summary: format!("signature verification failed for `{reference}`: {reason}"),
                 retryable: false,
                 details: Some(serde_json::json!({ "reference": reference, "reason": reason })),
             },
@@ -4043,25 +4086,46 @@ fn check_content_digest_match(
     })
 }
 
+/// Decode the DSSE envelope carried in the descriptor's [`DSSE_ANNOTATION_KEY`]
+/// annotation, if present. A malformed (non-base64) annotation yields `None` —
+/// the verifier then treats the artifact as carrying no decodable signature and
+/// fails closed in non-dev environments.
+fn dsse_envelope_bytes(descriptor: &ArtifactDescriptor) -> Option<Vec<u8>> {
+    let raw = descriptor.annotations.get(DSSE_ANNOTATION_KEY)?.as_str()?;
+    BASE64.decode(raw.as_bytes()).ok()
+}
+
+/// True if the descriptor carries any signature material (a DSSE envelope
+/// annotation or legacy signature refs).
+fn has_signature_material(descriptor: &ArtifactDescriptor) -> bool {
+    dsse_envelope_bytes(descriptor).is_some() || !descriptor.signature_refs.is_empty()
+}
+
+/// Outcome for the absence of (or a failure to verify) a signature, gated by
+/// environment: dev warns, staging/prod fail.
+fn signature_failure_outcome(environment: &VerificationEnvironment) -> VerificationOutcome {
+    match environment {
+        VerificationEnvironment::Dev => VerificationOutcome::Warning,
+        VerificationEnvironment::Staging | VerificationEnvironment::Prod => {
+            VerificationOutcome::Failed
+        }
+    }
+}
+
 fn check_signature_present(
     descriptor: &ArtifactDescriptor,
     verification_policy: &VerificationPolicy,
 ) -> VerificationCheck {
-    if descriptor.signature_refs.is_empty() {
-        let outcome = match verification_policy.environment {
-            VerificationEnvironment::Dev => VerificationOutcome::Warning,
-            VerificationEnvironment::Staging | VerificationEnvironment::Prod => {
-                if verification_policy.require_signature {
-                    VerificationOutcome::Failed
-                } else {
-                    VerificationOutcome::Warning
-                }
-            }
+    if !has_signature_material(descriptor) {
+        let outcome = if verification_policy.require_signature {
+            signature_failure_outcome(&verification_policy.environment)
+        } else {
+            VerificationOutcome::Warning
         };
         return make_check(
             "signature_present",
             outcome,
-            "no signature references are present",
+            "no signature is present",
             Some(serde_json::json!({
                 "count": 0,
                 "required": verification_policy.require_signature,
@@ -4072,9 +4136,9 @@ fn check_signature_present(
     make_check(
         "signature_present",
         VerificationOutcome::Passed,
-        "signature references are present",
+        "a signature is present",
         Some(serde_json::json!({
-            "count": descriptor.signature_refs.len(),
+            "count": 1 + descriptor.signature_refs.len(),
             "required": verification_policy.require_signature,
             "environment": verification_environment_name(&verification_policy.environment),
         })),
@@ -4085,34 +4149,95 @@ fn check_signature_verified(
     descriptor: &ArtifactDescriptor,
     verification_policy: &VerificationPolicy,
 ) -> VerificationCheck {
-    let detail = if descriptor.signature_refs.is_empty() {
-        "signature verification could not run because no signature references are present"
-    } else {
-        "signature verification is not implemented in the open-source client"
+    let Some(envelope) = dsse_envelope_bytes(descriptor) else {
+        // No verifiable DSSE envelope. If a signature is required, fail closed
+        // per environment; otherwise skip.
+        let outcome = if verification_policy.require_signature {
+            signature_failure_outcome(&verification_policy.environment)
+        } else {
+            VerificationOutcome::Skipped
+        };
+        return make_check(
+            "signature_verified",
+            outcome,
+            "no DSSE signature envelope is present to verify",
+            Some(serde_json::json!({
+                "verified": false,
+                "required": verification_policy.require_signature,
+                "environment": verification_environment_name(&verification_policy.environment),
+            })),
+        );
     };
-    let outcome = if verification_policy.require_signature {
-        match verification_policy.environment {
-            VerificationEnvironment::Dev => VerificationOutcome::Warning,
-            VerificationEnvironment::Staging | VerificationEnvironment::Prod => {
-                VerificationOutcome::Failed
-            }
+
+    let trust_root = TrustRoot::new(verification_policy.trusted_keys.clone());
+    match verify_artifact_dsse(&envelope, &descriptor.digest, &trust_root) {
+        Ok(verified) => make_check(
+            "signature_verified",
+            VerificationOutcome::Passed,
+            "DSSE signature verified against a trusted key",
+            Some(serde_json::json!({
+                "verified": true,
+                "verified_key_ids": verified.verified_key_ids,
+                "environment": verification_environment_name(&verification_policy.environment),
+            })),
+        ),
+        Err(err) => make_check(
+            "signature_verified",
+            // An untrusted or invalid signature is a hard failure in non-local
+            // environments; in dev it degrades to a warning.
+            signature_failure_outcome(&verification_policy.environment),
+            format!("DSSE signature verification failed: {err}"),
+            Some(serde_json::json!({
+                "verified": false,
+                "error": err.to_string(),
+                "trusted_key_count": verification_policy.trusted_keys.len(),
+                "environment": verification_environment_name(&verification_policy.environment),
+            })),
+        ),
+    }
+}
+
+/// Verify a single lock entry's DSSE signature against the policy trust root.
+///
+/// - Signature present: decode + verify against `digest`. Failure aborts in
+///   staging/prod; in dev it is a non-fatal warning.
+/// - Signature absent: only an error when `require_signature` is set in a
+///   non-dev environment.
+fn verify_lock_entry_signature(
+    reference: &str,
+    digest: &str,
+    signature: Option<&str>,
+    verification_policy: &VerificationPolicy,
+) -> Result<(), DistError> {
+    let non_dev = !matches!(
+        verification_policy.environment,
+        VerificationEnvironment::Dev
+    );
+    let Some(signature_b64) = signature else {
+        if verification_policy.require_signature && non_dev {
+            return Err(DistError::SignatureVerificationFailed {
+                reference: reference.to_string(),
+                reason: "lock entry has no signature but the policy requires one".to_string(),
+            });
         }
-    } else if descriptor.signature_refs.is_empty() {
-        VerificationOutcome::Skipped
-    } else {
-        VerificationOutcome::Warning
+        return Ok(());
     };
-    make_check(
-        "signature_verified",
-        outcome,
-        detail,
-        Some(serde_json::json!({
-            "implemented": false,
-            "signature_count": descriptor.signature_refs.len(),
-            "required": verification_policy.require_signature,
-            "environment": verification_environment_name(&verification_policy.environment),
-        })),
-    )
+
+    let result = BASE64
+        .decode(signature_b64.as_bytes())
+        .map_err(|e| format!("signature is not valid base64: {e}"))
+        .and_then(|envelope| {
+            let trust_root = TrustRoot::new(verification_policy.trusted_keys.clone());
+            verify_artifact_dsse(&envelope, digest, &trust_root).map_err(|e| e.to_string())
+        });
+    match result {
+        Ok(_) => Ok(()),
+        Err(reason) if non_dev => Err(DistError::SignatureVerificationFailed {
+            reference: reference.to_string(),
+            reason,
+        }),
+        Err(_) => Ok(()),
+    }
 }
 
 fn check_sbom_present(
@@ -4844,6 +4969,9 @@ struct LockComponent {
     ref_field: Option<String>,
     digest: Option<String>,
     name: Option<String>,
+    /// base64(std)-encoded DSSE envelope signing this entry (C2). Optional for
+    /// backward compatibility with unsigned locks.
+    signature: Option<String>,
 }
 
 impl LockEntry {
@@ -4852,6 +4980,7 @@ impl LockEntry {
             LockEntry::String(s) => LockResolvedEntry {
                 reference: Some(s.clone()),
                 digest: None,
+                signature: None,
             },
             LockEntry::Object(obj) => LockResolvedEntry {
                 reference: obj
@@ -4860,6 +4989,7 @@ impl LockEntry {
                     .or_else(|| obj.ref_field.clone())
                     .or_else(|| obj.digest.clone()),
                 digest: obj.digest.clone(),
+                signature: obj.signature.clone(),
             },
         }
     }
@@ -4869,6 +4999,7 @@ impl LockEntry {
 struct LockResolvedEntry {
     reference: Option<String>,
     digest: Option<String>,
+    signature: Option<String>,
 }
 
 fn parse_lockfile(data: &str) -> Result<Vec<LockResolvedEntry>, serde_json::Error> {
@@ -5539,5 +5670,259 @@ mod tests {
         );
         assert_eq!(downloaded.media_type, media_type);
         assert_eq!(downloaded.bytes, payload);
+    }
+}
+
+#[cfg(test)]
+mod signature_c2_tests {
+    use super::*;
+    use crate::signing::{
+        InTotoStatement, SlsaProvenance, key_id_for_public_key_pem, sign_statement,
+    };
+    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::pkcs8::EncodePrivateKey;
+    use ed25519_dalek::pkcs8::spki::EncodePublicKey;
+    use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+
+    const DIGEST_HEX: &str = "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234";
+
+    // (private PKCS8 PEM, public SPKI PEM, key_id) from a deterministic seed.
+    fn keypair(seed: u8) -> (String, String, String) {
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let priv_pem = sk.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
+        let pub_pem = sk
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let key_id = key_id_for_public_key_pem(&pub_pem).unwrap();
+        (priv_pem, pub_pem, key_id)
+    }
+
+    fn signed_envelope_b64(priv_pem: &str, key_id: &str, sha256_hex: &str) -> String {
+        let statement = InTotoStatement::provenance(
+            "customer.support.gtbundle",
+            sha256_hex,
+            SlsaProvenance {
+                builder_id: "greentic-bundle/test".into(),
+                build_type: "gtbundle".into(),
+                built_at: None,
+                tlog_entry_id: None,
+            },
+        );
+        let env = sign_statement(&statement, priv_pem, key_id).unwrap();
+        BASE64.encode(serde_json::to_vec(&env).unwrap())
+    }
+
+    fn descriptor_with_annotation(annotation: Option<String>) -> ArtifactDescriptor {
+        let mut annotations = serde_json::Map::new();
+        if let Some(value) = annotation {
+            annotations.insert(
+                DSSE_ANNOTATION_KEY.to_string(),
+                serde_json::Value::String(value),
+            );
+        }
+        ArtifactDescriptor {
+            artifact_type: ArtifactType::Bundle,
+            source_kind: ArtifactSourceKind::Oci,
+            raw_ref: "oci://example/bundle:1".into(),
+            canonical_ref: "oci://example/bundle@sha256:...".into(),
+            digest: format!("sha256:{DIGEST_HEX}"),
+            media_type: "application/vnd.greentic.bundle".into(),
+            size_bytes: 1,
+            created_at: None,
+            annotations,
+            manifest_digest: None,
+            resolved_via: ResolvedVia::Direct,
+            signature_refs: Vec::new(),
+            sbom_refs: Vec::new(),
+        }
+    }
+
+    fn policy(
+        env: VerificationEnvironment,
+        trusted: Vec<TrustedKey>,
+        require: bool,
+    ) -> VerificationPolicy {
+        VerificationPolicy {
+            require_signature: require,
+            trusted_keys: trusted,
+            environment: env,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn verified_when_trusted_key_signs_matching_digest() {
+        let (priv_pem, pub_pem, key_id) = keypair(11);
+        let desc =
+            descriptor_with_annotation(Some(signed_envelope_b64(&priv_pem, &key_id, DIGEST_HEX)));
+        for env in [
+            VerificationEnvironment::Dev,
+            VerificationEnvironment::Staging,
+            VerificationEnvironment::Prod,
+        ] {
+            let pol = policy(
+                env.clone(),
+                vec![TrustedKey {
+                    key_id: key_id.clone(),
+                    public_key_pem: pub_pem.clone(),
+                }],
+                true,
+            );
+            let check = check_signature_verified(&desc, &pol);
+            assert_eq!(check.outcome, VerificationOutcome::Passed, "env={env:?}");
+        }
+    }
+
+    #[test]
+    fn untrusted_signature_fails_in_prod_warns_in_dev() {
+        let (priv_pem, _pub_pem, key_id) = keypair(12);
+        let (_p2, other_pub, other_id) = keypair(13);
+        let desc =
+            descriptor_with_annotation(Some(signed_envelope_b64(&priv_pem, &key_id, DIGEST_HEX)));
+        let trusted = vec![TrustedKey {
+            key_id: other_id,
+            public_key_pem: other_pub,
+        }];
+        assert_eq!(
+            check_signature_verified(
+                &desc,
+                &policy(VerificationEnvironment::Prod, trusted.clone(), true)
+            )
+            .outcome,
+            VerificationOutcome::Failed
+        );
+        assert_eq!(
+            check_signature_verified(&desc, &policy(VerificationEnvironment::Dev, trusted, true))
+                .outcome,
+            VerificationOutcome::Warning
+        );
+    }
+
+    #[test]
+    fn digest_mismatch_fails_in_prod() {
+        let (priv_pem, pub_pem, key_id) = keypair(14);
+        // Sign a *different* digest than the descriptor pins.
+        let other = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let desc = descriptor_with_annotation(Some(signed_envelope_b64(&priv_pem, &key_id, other)));
+        let pol = policy(
+            VerificationEnvironment::Prod,
+            vec![TrustedKey {
+                key_id,
+                public_key_pem: pub_pem,
+            }],
+            true,
+        );
+        assert_eq!(
+            check_signature_verified(&desc, &pol).outcome,
+            VerificationOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn missing_envelope_skips_when_not_required_fails_when_required() {
+        let desc = descriptor_with_annotation(None);
+        assert_eq!(
+            check_signature_verified(&desc, &policy(VerificationEnvironment::Prod, vec![], false))
+                .outcome,
+            VerificationOutcome::Skipped
+        );
+        assert_eq!(
+            check_signature_verified(&desc, &policy(VerificationEnvironment::Prod, vec![], true))
+                .outcome,
+            VerificationOutcome::Failed
+        );
+        // Required-but-missing in dev only warns.
+        assert_eq!(
+            check_signature_verified(&desc, &policy(VerificationEnvironment::Dev, vec![], true))
+                .outcome,
+            VerificationOutcome::Warning
+        );
+    }
+
+    #[test]
+    fn signature_present_reflects_annotation() {
+        let (priv_pem, _pub, key_id) = keypair(15);
+        let signed =
+            descriptor_with_annotation(Some(signed_envelope_b64(&priv_pem, &key_id, DIGEST_HEX)));
+        let unsigned = descriptor_with_annotation(None);
+        assert_eq!(
+            check_signature_present(
+                &signed,
+                &policy(VerificationEnvironment::Prod, vec![], false)
+            )
+            .outcome,
+            VerificationOutcome::Passed
+        );
+        assert_eq!(
+            check_signature_present(
+                &unsigned,
+                &policy(VerificationEnvironment::Prod, vec![], true)
+            )
+            .outcome,
+            VerificationOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn lock_entry_signature_gate() {
+        let (priv_pem, pub_pem, key_id) = keypair(16);
+        let digest = format!("sha256:{DIGEST_HEX}");
+        let good = signed_envelope_b64(&priv_pem, &key_id, DIGEST_HEX);
+        let trusted = vec![TrustedKey {
+            key_id: key_id.clone(),
+            public_key_pem: pub_pem,
+        }];
+
+        // Valid signature against a trusted key passes in prod.
+        assert!(
+            verify_lock_entry_signature(
+                "pack-a",
+                &digest,
+                Some(&good),
+                &policy(VerificationEnvironment::Prod, trusted.clone(), true),
+            )
+            .is_ok()
+        );
+
+        // Untrusted (empty trust root) fails in prod, warns (Ok) in dev.
+        assert!(matches!(
+            verify_lock_entry_signature(
+                "pack-a",
+                &digest,
+                Some(&good),
+                &policy(VerificationEnvironment::Prod, vec![], true),
+            ),
+            Err(DistError::SignatureVerificationFailed { .. })
+        ));
+        assert!(
+            verify_lock_entry_signature(
+                "pack-a",
+                &digest,
+                Some(&good),
+                &policy(VerificationEnvironment::Dev, vec![], true),
+            )
+            .is_ok()
+        );
+
+        // Missing signature: required+prod fails, not-required passes.
+        assert!(matches!(
+            verify_lock_entry_signature(
+                "pack-a",
+                &digest,
+                None,
+                &policy(VerificationEnvironment::Prod, trusted.clone(), true),
+            ),
+            Err(DistError::SignatureVerificationFailed { .. })
+        ));
+        assert!(
+            verify_lock_entry_signature(
+                "pack-a",
+                &digest,
+                None,
+                &policy(VerificationEnvironment::Prod, trusted, false),
+            )
+            .is_ok()
+        );
     }
 }
