@@ -126,6 +126,8 @@ pub struct ResolvedPack {
     pub path: PathBuf,
     pub fetched_from_network: bool,
     pub manifest_digest: Option<String>,
+    /// OCI manifest annotations carried from the pull (signature material, etc.).
+    pub manifest_annotations: Option<HashMap<String, String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -137,6 +139,10 @@ struct CacheMetadata {
     size_bytes: u64,
     #[serde(default)]
     manifest_digest: Option<String>,
+    /// OCI manifest annotations (signature material, etc.), persisted so a
+    /// cache-hit resolution restores them rather than dropping them.
+    #[serde(default)]
+    manifest_annotations: Option<HashMap<String, String>>,
 }
 
 /// Fetch OCI packs with caching and offline support.
@@ -235,6 +241,7 @@ impl<C: RegistryClient> OciPackFetcher<C> {
             .or_else(|| chosen_layer.digest.clone())
             .unwrap_or_else(|| compute_digest(&chosen_layer.data));
         let manifest_digest = image.digest.clone();
+        let manifest_annotations = image.manifest_annotations.clone();
 
         if let Some(expected) = expected_digest.as_ref()
             && expected != &resolved_digest
@@ -252,6 +259,7 @@ impl<C: RegistryClient> OciPackFetcher<C> {
             &chosen_layer.data,
             reference,
             manifest_digest.clone(),
+            manifest_annotations.clone(),
         )?;
 
         Ok(ResolvedPack {
@@ -261,6 +269,7 @@ impl<C: RegistryClient> OciPackFetcher<C> {
             path,
             fetched_from_network: true,
             manifest_digest,
+            manifest_annotations,
         })
     }
 }
@@ -397,6 +406,7 @@ impl PackCache {
         data: &[u8],
         reference: &str,
         manifest_digest: Option<String>,
+        manifest_annotations: Option<HashMap<String, String>>,
     ) -> Result<PathBuf, OciPackError> {
         let dir = self.artifact_dir(digest);
         fs::create_dir_all(&dir).map_err(|source| OciPackError::Io {
@@ -419,6 +429,7 @@ impl PackCache {
                 .as_secs(),
             size_bytes: data.len() as u64,
             manifest_digest,
+            manifest_annotations,
         };
         let metadata_path = dir.join("metadata.json");
         let buf = serde_json::to_vec(&metadata).map_err(|source| OciPackError::Serde {
@@ -444,13 +455,16 @@ impl PackCache {
         if !path.exists() {
             return None;
         }
+        let manifest_digest = metadata.as_ref().and_then(|m| m.manifest_digest.clone());
+        let manifest_annotations = metadata.and_then(|m| m.manifest_annotations);
         Some(ResolvedPack {
             original_reference: reference.to_string(),
             resolved_digest: digest.to_string(),
             media_type,
             path,
             fetched_from_network: false,
-            manifest_digest: metadata.and_then(|m| m.manifest_digest),
+            manifest_digest,
+            manifest_annotations,
         })
     }
 
@@ -489,10 +503,12 @@ fn trim_digest_prefix(digest: &str) -> &str {
         .unwrap_or_else(|| digest.trim_start_matches('@'))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PulledImage {
     pub digest: Option<String>,
     pub layers: Vec<PulledLayer>,
+    /// OCI manifest-level annotations (e.g. a `dev.greentic.dsse` signature).
+    pub manifest_annotations: Option<HashMap<String, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -688,9 +704,11 @@ fn convert_image(image: ImageData) -> PulledImage {
             }
         })
         .collect();
+    let manifest_annotations = image.manifest.and_then(|m| m.annotations);
     PulledImage {
         digest: image.digest,
         layers,
+        manifest_annotations,
     }
 }
 

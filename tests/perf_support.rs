@@ -163,6 +163,7 @@ pub fn component_image(data: &[u8], media_type: &str, digest: &str) -> Component
             data: data.to_vec(),
             digest: Some(digest.to_string()),
         }],
+        ..Default::default()
     }
 }
 
@@ -171,6 +172,7 @@ pub fn component_image_with_layers(layers: Vec<ComponentPulledLayer>) -> Compone
     ComponentPulledImage {
         digest: None,
         layers,
+        ..Default::default()
     }
 }
 
@@ -183,6 +185,7 @@ pub fn pack_image(data: &[u8], media_type: &str, digest: &str) -> PackPulledImag
             data: data.to_vec(),
             digest: Some(digest.to_string()),
         }],
+        ..Default::default()
     }
 }
 
