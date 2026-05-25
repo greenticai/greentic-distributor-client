@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::pkcs8::{DecodePrivateKey, DecodePublicKey};
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -175,8 +175,19 @@ impl TrustRoot {
         self.keys.is_empty()
     }
 
+    /// Case-insensitive key id lookup. Trust-root key ids and signature key ids
+    /// are hex SHA-256 prefixes; operators may supply either case in config,
+    /// while [`key_id_for_public_key_pem`] always emits lowercase. An empty
+    /// key id never matches — that prevents a misconfigured trust-root entry
+    /// (empty key_id from a missing JSON field) from binding to an attacker's
+    /// envelope whose `keyid` defaults to the empty string.
     fn find(&self, key_id: &str) -> Option<&TrustedKey> {
-        self.keys.iter().find(|k| k.key_id == key_id)
+        if key_id.is_empty() {
+            return None;
+        }
+        self.keys
+            .iter()
+            .find(|k| !k.key_id.is_empty() && k.key_id.eq_ignore_ascii_case(key_id))
     }
 }
 
@@ -271,6 +282,7 @@ pub fn verify_envelope(
     let pae_bytes = pae(&envelope.payload_type, &payload_bytes);
     let mut tried = Vec::new();
     let mut verified_key_ids = Vec::new();
+    let mut last_invalid: Option<String> = None;
     for sig in &envelope.signatures {
         tried.push(sig.keyid.clone());
         let Some(trusted) = trust_root.find(&sig.keyid) else {
@@ -287,21 +299,38 @@ pub fn verify_envelope(
                 })?;
         let signature = Signature::from_slice(&sig_bytes)
             .map_err(|e| SigningError::KeyDecode(format!("signature bytes: {e}")))?;
-        if vk.verify(&pae_bytes, &signature).is_err() {
-            return Err(SigningError::SignatureInvalid {
-                key_id: sig.keyid.clone(),
-            });
+        // `verify_strict` rejects non-canonical signatures (malleable S),
+        // matching DSSE/sigstore guidance. We must NOT short-circuit on the
+        // first failure: DSSE requires "at least one valid trusted signature",
+        // so a corrupted (or attacker-injected) sig for one trusted key id
+        // cannot poison verification against the others.
+        if vk.verify_strict(&pae_bytes, &signature).is_err() {
+            last_invalid = Some(sig.keyid.clone());
+            continue;
         }
         verified_key_ids.push(sig.keyid.clone());
     }
 
     if verified_key_ids.is_empty() {
+        if let Some(key_id) = last_invalid {
+            return Err(SigningError::SignatureInvalid { key_id });
+        }
         return Err(SigningError::NoTrustedKey(tried.join(", ")));
     }
     Ok(VerifiedStatement {
         statement,
         verified_key_ids,
     })
+}
+
+/// Strip a leading `sha256:` prefix if present (case-insensitive). Used to
+/// reconcile bare-hex and `sha256:`-prefixed digests on both sides of the
+/// subject-vs-artifact comparison in [`verify_artifact_dsse`].
+fn strip_sha256_prefix(digest: &str) -> &str {
+    digest
+        .strip_prefix("sha256:")
+        .or_else(|| digest.strip_prefix("SHA256:"))
+        .unwrap_or(digest)
 }
 
 /// Verify a serialized DSSE envelope and confirm its subject pins
@@ -315,13 +344,16 @@ pub fn verify_artifact_dsse(
     let envelope: DsseEnvelope = serde_json::from_slice(envelope_json)
         .map_err(|e| SigningError::MalformedEnvelope(e.to_string()))?;
     let verified = verify_envelope(&envelope, trust_root)?;
-    let expected = expected_sha256
-        .strip_prefix("sha256:")
-        .unwrap_or(expected_sha256);
-    let pinned = verified
+    let expected = strip_sha256_prefix(expected_sha256);
+    let pinned_raw = verified
         .statement
         .subject_sha256()
         .ok_or(SigningError::NoSubjectDigest)?;
+    // Strip the prefix on BOTH sides: a publisher mistake that pins
+    // `sha256:<hex>` into the subject (instead of the bare hex) would
+    // otherwise fail SubjectDigestMismatch for a signature that is actually
+    // bound to the right artifact.
+    let pinned = strip_sha256_prefix(pinned_raw);
     if !pinned.eq_ignore_ascii_case(expected) {
         return Err(SigningError::SubjectDigestMismatch {
             statement: pinned.to_string(),
@@ -484,5 +516,78 @@ mod tests {
     #[test]
     fn pae_encoding_is_spec_shaped() {
         assert_eq!(pae("t", b"hi"), b"DSSEv1 1 t 2 hi".to_vec());
+    }
+
+    // C2 fix: DSSE requires "at least one valid trusted signature". A
+    // corrupted signature for one trusted keyid must not poison verification
+    // against a second trusted keyid.
+    #[test]
+    fn multi_sig_one_bad_one_good_verifies() {
+        let (_priv_a, pub_a, key_id_a) = keypair(20);
+        let (priv_b, pub_b, key_id_b) = keypair(21);
+        // Sign with B, then prepend a bogus signature claiming key id A.
+        let mut env = sign_statement(&statement(DIGEST), &priv_b, &key_id_b).unwrap();
+        let bogus = DsseSignature {
+            keyid: key_id_a.clone(),
+            sig: BASE64.encode([0u8; 64]),
+        };
+        env.signatures.insert(0, bogus);
+
+        let trust = TrustRoot::new(vec![
+            TrustedKey {
+                key_id: key_id_a,
+                public_key_pem: pub_a,
+            },
+            TrustedKey {
+                key_id: key_id_b.clone(),
+                public_key_pem: pub_b,
+            },
+        ]);
+        let bytes = serde_json::to_vec(&env).unwrap();
+        let verified = verify_artifact_dsse(&bytes, DIGEST, &trust).unwrap();
+        assert_eq!(verified.verified_key_ids, vec![key_id_b]);
+    }
+
+    // C2 fix: TrustRoot lookup must be case-insensitive — operators may paste
+    // uppercase hex from sha256sum/hex-dump tools while sign_statement always
+    // emits lowercase via hex::encode.
+    #[test]
+    fn trust_root_find_is_case_insensitive() {
+        let (priv_pem, pub_pem, key_id) = keypair(22);
+        let env = sign_statement(&statement(DIGEST), &priv_pem, &key_id).unwrap();
+        let trust = TrustRoot::new(vec![TrustedKey {
+            key_id: key_id.to_ascii_uppercase(),
+            public_key_pem: pub_pem,
+        }]);
+        let bytes = serde_json::to_vec(&env).unwrap();
+        verify_artifact_dsse(&bytes, DIGEST, &trust).unwrap();
+    }
+
+    // C2 fix: an envelope `keyid: ""` must never match a misconfigured
+    // trust-root entry whose key_id is also empty.
+    #[test]
+    fn trust_root_find_rejects_empty_key_id() {
+        let (_priv, pub_pem, _id) = keypair(23);
+        let trust = TrustRoot::new(vec![TrustedKey {
+            key_id: String::new(),
+            public_key_pem: pub_pem,
+        }]);
+        assert!(trust.find("").is_none());
+        assert!(trust.find("anything").is_none());
+    }
+
+    // C2 fix: a publisher mistake that stores `sha256:<hex>` in the subject
+    // (instead of the bare hex) must not produce a false SubjectDigestMismatch.
+    #[test]
+    fn verify_strips_sha256_prefix_on_both_sides() {
+        let (priv_pem, pub_pem, key_id) = keypair(24);
+        let prefixed = format!("sha256:{DIGEST}");
+        let env = sign_statement(&statement(&prefixed), &priv_pem, &key_id).unwrap();
+        let trust = TrustRoot::new(vec![TrustedKey {
+            key_id,
+            public_key_pem: pub_pem,
+        }]);
+        let bytes = serde_json::to_vec(&env).unwrap();
+        verify_artifact_dsse(&bytes, DIGEST, &trust).unwrap();
     }
 }

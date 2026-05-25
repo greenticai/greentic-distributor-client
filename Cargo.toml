@@ -84,6 +84,7 @@ rpassword = "7"
 tempfile = { workspace = true }
 base64 = "0.22"
 hex = "0.4"
+tracing = "0.1"
 
 [dependencies.ed25519-dalek]
 version = "2"

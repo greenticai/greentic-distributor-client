@@ -2527,8 +2527,18 @@ impl DistClient {
         let entries = parse_lockfile(&contents)?;
         let mut resolved = Vec::with_capacity(entries.len());
         for entry in entries {
+            // Verify the entry signature BEFORE persisting anything to the dist
+            // cache. A mid-loop failure must not leave preceding entries in the
+            // cache as "verified-on-load" artifacts (supply-chain replay risk).
             let resolved_item = if let Some(digest) = entry.digest.as_ref() {
                 if let Ok(item) = self.open_cached(digest) {
+                    let reference = entry.reference.as_deref().unwrap_or(digest);
+                    verify_lock_entry_signature(
+                        reference,
+                        &item.descriptor.digest,
+                        entry.signature.as_deref(),
+                        verification_policy,
+                    )?;
                     item
                 } else {
                     let reference = entry
@@ -2547,6 +2557,12 @@ impl DistClient {
                         });
                     }
                     descriptor.digest = digest.clone();
+                    verify_lock_entry_signature(
+                        &reference,
+                        &descriptor.digest,
+                        entry.signature.as_deref(),
+                        verification_policy,
+                    )?;
                     self.fetch(&descriptor, CachePolicy).await?
                 }
             } else {
@@ -2556,17 +2572,14 @@ impl DistClient {
                     .ok_or_else(|| DistError::InvalidInput("lock entry missing ref".into()))?;
                 let source = self.parse_source(&reference)?;
                 let descriptor = self.resolve(source, ResolvePolicy).await?;
+                verify_lock_entry_signature(
+                    &reference,
+                    &descriptor.digest,
+                    entry.signature.as_deref(),
+                    verification_policy,
+                )?;
                 self.fetch(&descriptor, CachePolicy).await?
             };
-            verify_lock_entry_signature(
-                entry
-                    .reference
-                    .as_deref()
-                    .unwrap_or(&resolved_item.descriptor.digest),
-                &resolved_item.descriptor.digest,
-                entry.signature.as_deref(),
-                verification_policy,
-            )?;
             resolved.push(resolved_item);
         }
         Ok(resolved)
@@ -3824,7 +3837,14 @@ fn verification_report_from_checks(
 }
 
 fn policy_fingerprint(policy: &VerificationPolicy) -> String {
-    let bytes = serde_json::to_vec(policy).unwrap_or_default();
+    // `trusted_keys` is a `Vec`, but two policies with the same keys in
+    // different order are semantically identical — sort by key id before
+    // hashing so reordering a config array does not appear as policy drift.
+    let mut canonical = policy.clone();
+    canonical
+        .trusted_keys
+        .sort_by(|a, b| a.key_id.cmp(&b.key_id));
+    let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
     digest_for_bytes(&bytes)
 }
 
@@ -4106,24 +4126,40 @@ fn check_content_digest_match(
     })
 }
 
-/// Decode the DSSE envelope carried in the descriptor's [`DSSE_ANNOTATION_KEY`]
-/// annotation, if present. A malformed (non-base64) annotation yields `None` —
-/// the verifier then treats the artifact as carrying no decodable signature and
-/// fails closed in non-dev environments.
-fn dsse_envelope_bytes(descriptor: &ArtifactDescriptor) -> Option<Vec<u8>> {
-    let raw = descriptor.annotations.get(DSSE_ANNOTATION_KEY)?.as_str()?;
-    BASE64.decode(raw.as_bytes()).ok()
+/// Status of the DSSE envelope material carried on a descriptor. We
+/// distinguish *absent* (no annotation) from *malformed* (annotation present
+/// but the value is the wrong JSON type or not valid base64), so that a
+/// publisher's intent to sign is never silently downgraded to "unsigned".
+enum DsseEnvelopeStatus {
+    Absent,
+    Malformed(&'static str),
+    Present(Vec<u8>),
 }
 
-/// True if the descriptor carries any signature material (a DSSE envelope
-/// annotation or legacy signature refs).
-fn has_signature_material(descriptor: &ArtifactDescriptor) -> bool {
-    dsse_envelope_bytes(descriptor).is_some() || !descriptor.signature_refs.is_empty()
+fn dsse_envelope_status(descriptor: &ArtifactDescriptor) -> DsseEnvelopeStatus {
+    let Some(value) = descriptor.annotations.get(DSSE_ANNOTATION_KEY) else {
+        return DsseEnvelopeStatus::Absent;
+    };
+    let Some(raw) = value.as_str() else {
+        return DsseEnvelopeStatus::Malformed("annotation value is not a JSON string");
+    };
+    match BASE64.decode(raw.as_bytes()) {
+        Ok(bytes) => DsseEnvelopeStatus::Present(bytes),
+        Err(_) => DsseEnvelopeStatus::Malformed("annotation is not valid base64"),
+    }
 }
 
-/// Outcome for the absence of (or a failure to verify) a signature, gated by
-/// environment: dev warns, staging/prod fail.
-fn signature_failure_outcome(environment: &VerificationEnvironment) -> VerificationOutcome {
+/// Outcome when a signature is missing or fails verification. When the policy
+/// does not require a signature, signatures are advisory: any failure is a
+/// Warning regardless of environment. When the policy requires a signature,
+/// failures are environment-gated — Warning in dev, Failed in staging/prod.
+fn signature_failure_outcome(
+    environment: &VerificationEnvironment,
+    require_signature: bool,
+) -> VerificationOutcome {
+    if !require_signature {
+        return VerificationOutcome::Warning;
+    }
     match environment {
         VerificationEnvironment::Dev => VerificationOutcome::Warning,
         VerificationEnvironment::Staging | VerificationEnvironment::Prod => {
@@ -4136,12 +4172,17 @@ fn check_signature_present(
     descriptor: &ArtifactDescriptor,
     verification_policy: &VerificationPolicy,
 ) -> VerificationCheck {
-    if !has_signature_material(descriptor) {
-        let outcome = if verification_policy.require_signature {
-            signature_failure_outcome(&verification_policy.environment)
-        } else {
-            VerificationOutcome::Warning
-        };
+    let status = dsse_envelope_status(descriptor);
+    let dsse_count = match &status {
+        DsseEnvelopeStatus::Absent => 0,
+        DsseEnvelopeStatus::Malformed(_) | DsseEnvelopeStatus::Present(_) => 1,
+    };
+    let count = dsse_count + descriptor.signature_refs.len();
+    if count == 0 {
+        let outcome = signature_failure_outcome(
+            &verification_policy.environment,
+            verification_policy.require_signature,
+        );
         return make_check(
             "signature_present",
             outcome,
@@ -4158,7 +4199,7 @@ fn check_signature_present(
         VerificationOutcome::Passed,
         "a signature is present",
         Some(serde_json::json!({
-            "count": 1 + descriptor.signature_refs.len(),
+            "count": count,
             "required": verification_policy.require_signature,
             "environment": verification_environment_name(&verification_policy.environment),
         })),
@@ -4169,24 +4210,47 @@ fn check_signature_verified(
     descriptor: &ArtifactDescriptor,
     verification_policy: &VerificationPolicy,
 ) -> VerificationCheck {
-    let Some(envelope) = dsse_envelope_bytes(descriptor) else {
-        // No verifiable DSSE envelope. If a signature is required, fail closed
-        // per environment; otherwise skip.
-        let outcome = if verification_policy.require_signature {
-            signature_failure_outcome(&verification_policy.environment)
-        } else {
-            VerificationOutcome::Skipped
-        };
-        return make_check(
-            "signature_verified",
-            outcome,
-            "no DSSE signature envelope is present to verify",
-            Some(serde_json::json!({
-                "verified": false,
-                "required": verification_policy.require_signature,
-                "environment": verification_environment_name(&verification_policy.environment),
-            })),
-        );
+    let env = &verification_policy.environment;
+    let required = verification_policy.require_signature;
+    let env_name = verification_environment_name(env);
+    let envelope = match dsse_envelope_status(descriptor) {
+        DsseEnvelopeStatus::Present(bytes) => bytes,
+        DsseEnvelopeStatus::Absent => {
+            // No annotation at all. If a signature is required, fail closed per
+            // environment; otherwise skip (the operator has not opted in).
+            let outcome = if required {
+                signature_failure_outcome(env, true)
+            } else {
+                VerificationOutcome::Skipped
+            };
+            return make_check(
+                "signature_verified",
+                outcome,
+                "no DSSE signature envelope is present to verify",
+                Some(serde_json::json!({
+                    "verified": false,
+                    "required": required,
+                    "environment": env_name,
+                })),
+            );
+        }
+        DsseEnvelopeStatus::Malformed(reason) => {
+            // The publisher attached signature material but it is not decodable.
+            // This is NOT "no signature" — surface it as a verification failure
+            // so a corrupted annotation cannot silently downgrade to "unsigned".
+            return make_check(
+                "signature_verified",
+                signature_failure_outcome(env, required),
+                format!("DSSE signature envelope is malformed: {reason}"),
+                Some(serde_json::json!({
+                    "verified": false,
+                    "malformed": true,
+                    "reason": reason,
+                    "required": required,
+                    "environment": env_name,
+                })),
+            );
+        }
     };
 
     let trust_root = TrustRoot::new(verification_policy.trusted_keys.clone());
@@ -4198,20 +4262,24 @@ fn check_signature_verified(
             Some(serde_json::json!({
                 "verified": true,
                 "verified_key_ids": verified.verified_key_ids,
-                "environment": verification_environment_name(&verification_policy.environment),
+                "environment": env_name,
             })),
         ),
         Err(err) => make_check(
             "signature_verified",
-            // An untrusted or invalid signature is a hard failure in non-local
-            // environments; in dev it degrades to a warning.
-            signature_failure_outcome(&verification_policy.environment),
+            // Failure outcome is gated by `require_signature`: with signatures
+            // advisory (require_signature=false), an invalid or untrusted
+            // signature is a Warning in any environment; with signatures
+            // required, it is env-gated (Warning in dev, Failed in
+            // staging/prod).
+            signature_failure_outcome(env, required),
             format!("DSSE signature verification failed: {err}"),
             Some(serde_json::json!({
                 "verified": false,
                 "error": err.to_string(),
                 "trusted_key_count": verification_policy.trusted_keys.len(),
-                "environment": verification_environment_name(&verification_policy.environment),
+                "required": required,
+                "environment": env_name,
             })),
         ),
     }
@@ -4256,7 +4324,19 @@ fn verify_lock_entry_signature(
             reference: reference.to_string(),
             reason,
         }),
-        Err(_) => Ok(()),
+        Err(reason) => {
+            // Dev environments degrade hard failures to a warning so the
+            // default `pull_lock` path stays non-fatal — but the developer
+            // still needs to see that a signature failed. Silent acceptance
+            // would defeat the warn contract documented on this function.
+            tracing::warn!(
+                target: "greentic_distributor_client::signing",
+                reference,
+                reason,
+                "lock entry signature did not verify in dev; continuing"
+            );
+            Ok(())
+        }
     }
 }
 
@@ -6062,5 +6142,83 @@ mod signature_c2_tests {
             )
             .is_ok()
         );
+    }
+
+    // C2 fix: when require_signature=false, a DSSE annotation that fails to
+    // verify is *advisory* — Warning in every environment, never Failed. Old
+    // behavior unconditionally hit signature_failure_outcome(Prod)=Failed,
+    // which broke upgrade flows for operators who hadn't yet provisioned a
+    // trust root.
+    #[test]
+    fn untrusted_signature_with_require_false_warns_even_in_prod() {
+        let (priv_pem, _pub, key_id) = keypair(30);
+        let desc =
+            descriptor_with_annotation(Some(signed_envelope_b64(&priv_pem, &key_id, DIGEST_HEX)));
+        // Empty trust root, require_signature=false, Prod.
+        let pol = policy(VerificationEnvironment::Prod, vec![], false);
+        assert_eq!(
+            check_signature_verified(&desc, &pol).outcome,
+            VerificationOutcome::Warning
+        );
+    }
+
+    // C2 fix: a corrupted base64 DSSE annotation must surface as a
+    // verification failure ("Malformed"), not silently downgrade to
+    // "no signature present" (Skipped).
+    #[test]
+    fn malformed_base64_annotation_fails_signature_check() {
+        let mut desc = descriptor_with_annotation(None);
+        desc.annotations.insert(
+            DSSE_ANNOTATION_KEY.to_string(),
+            serde_json::Value::String("!!!not-base64!!!".to_string()),
+        );
+        let pol_prod_required = policy(VerificationEnvironment::Prod, vec![], true);
+        let check = check_signature_verified(&desc, &pol_prod_required);
+        assert_eq!(check.outcome, VerificationOutcome::Failed);
+        assert!(
+            check.detail.contains("malformed"),
+            "detail should mention malformed: {}",
+            check.detail
+        );
+        // Advisory mode: Warning (not Skipped, not Failed).
+        let pol_prod_optional = policy(VerificationEnvironment::Prod, vec![], false);
+        assert_eq!(
+            check_signature_verified(&desc, &pol_prod_optional).outcome,
+            VerificationOutcome::Warning
+        );
+    }
+
+    // C2 fix: a non-string JSON annotation value (object/number/array) must
+    // also surface as Malformed, not silently treated as "no signature".
+    #[test]
+    fn non_string_annotation_value_fails_signature_check() {
+        let mut desc = descriptor_with_annotation(None);
+        desc.annotations.insert(
+            DSSE_ANNOTATION_KEY.to_string(),
+            serde_json::json!({"envelope": "wrong-shape"}),
+        );
+        let pol = policy(VerificationEnvironment::Prod, vec![], true);
+        let check = check_signature_verified(&desc, &pol);
+        assert_eq!(check.outcome, VerificationOutcome::Failed);
+        assert!(check.detail.contains("malformed"));
+    }
+
+    // C2 fix: check_signature_present must reflect the *actual* count of
+    // signature sources, not unconditionally add 1 for a phantom DSSE entry.
+    #[test]
+    fn signature_present_count_reflects_actual_sources() {
+        let mut desc = descriptor_with_annotation(None);
+        // Legacy signature_refs only, no DSSE annotation.
+        desc.signature_refs = vec!["legacy-ref".to_string()];
+        let pol = policy(VerificationEnvironment::Prod, vec![], false);
+        let check = check_signature_present(&desc, &pol);
+        assert_eq!(check.outcome, VerificationOutcome::Passed);
+        let count = check
+            .payload
+            .as_ref()
+            .and_then(|p| p.get("count"))
+            .and_then(|c| c.as_u64())
+            .unwrap();
+        assert_eq!(count, 1, "expected one legacy ref, got count={count}");
     }
 }
