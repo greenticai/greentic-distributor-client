@@ -75,6 +75,7 @@ fn seed_cached_blob(temp: &TempDir, reference: &str, bytes: &[u8]) -> String {
         state: CacheEntryState::Ready,
         advisory_epoch: None,
         signature_summary: None,
+        annotations: serde_json::Map::new(),
         local_path: blob_path.clone(),
         source_snapshot: SourceSnapshot {
             raw_ref: reference.to_string(),

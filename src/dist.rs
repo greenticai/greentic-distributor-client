@@ -163,6 +163,11 @@ pub struct CacheEntry {
     pub state: CacheEntryState,
     pub advisory_epoch: Option<u64>,
     pub signature_summary: Option<serde_json::Value>,
+    /// Descriptor annotations (incl. a `dev.greentic.dsse` signature envelope)
+    /// preserved across cache round-trips so warm/rollback can re-verify a
+    /// signature captured at stage time. Serde-default for older cache files.
+    #[serde(default)]
+    pub annotations: serde_json::Map<String, serde_json::Value>,
     pub local_path: PathBuf,
     pub source_snapshot: SourceSnapshot,
 }
@@ -1002,6 +1007,7 @@ impl StoreDownloadRegistryClient for DefaultStoreDownloadRegistryClient {
                     digest: None,
                 })
                 .collect(),
+            manifest_annotations: image.manifest.and_then(|m| m.annotations),
         })
     }
 }
@@ -1353,7 +1359,7 @@ impl DistClient {
             media_type: normalize_content_type(Some(&resolved.media_type), WASM_CONTENT_TYPE),
             size_bytes: resolved.size_bytes,
             created_at: None,
-            annotations: serde_json::Map::new(),
+            annotations: annotations_to_map(resolved.manifest_annotations),
             manifest_digest: resolved.manifest_digest,
             resolved_via: if reference.contains(':') && !reference.contains("@sha256:") {
                 ResolvedVia::TagResolution
@@ -1612,7 +1618,7 @@ impl DistClient {
             media_type: resolved.media_type,
             size_bytes: file_size_if_exists(&resolved.path).unwrap_or_default(),
             created_at: None,
-            annotations: serde_json::Map::new(),
+            annotations: annotations_to_map(resolved.manifest_annotations),
             manifest_digest: resolved.manifest_digest,
             resolved_via: if reference.contains(':') && !reference.contains("@sha256:") {
                 ResolvedVia::TagResolution
@@ -1755,6 +1761,7 @@ impl DistClient {
         artifact.descriptor.artifact_type = artifact_type;
         artifact.descriptor.media_type = resolved.media_type;
         artifact.descriptor.manifest_digest = resolved.manifest_digest;
+        artifact.descriptor.annotations = annotations_to_map(resolved.manifest_annotations);
         self.persist_cache_entry(&artifact)?;
         self.enforce_cache_cap(Some(&artifact.descriptor.digest))?;
         artifact.validate_payload()?;
@@ -1783,6 +1790,7 @@ impl DistClient {
             state: cache_entry_state_from_integrity(&artifact.integrity_state),
             advisory_epoch: None,
             signature_summary: None,
+            annotations: artifact.descriptor.annotations.clone(),
             local_path,
             source_snapshot: artifact.source_snapshot.clone(),
         };
@@ -3674,6 +3682,18 @@ fn integrity_state_from_entry(state: &CacheEntryState) -> IntegrityState {
     }
 }
 
+/// Convert OCI manifest annotations (`HashMap<String, String>`) into the
+/// descriptor's `serde_json::Map`, the form the signature verifier reads.
+fn annotations_to_map(
+    annotations: Option<std::collections::HashMap<String, String>>,
+) -> serde_json::Map<String, serde_json::Value> {
+    annotations
+        .into_iter()
+        .flatten()
+        .map(|(k, v)| (k, serde_json::Value::String(v)))
+        .collect()
+}
+
 fn descriptor_from_entry(entry: &CacheEntry) -> ArtifactDescriptor {
     ArtifactDescriptor {
         artifact_type: entry.artifact_type.clone(),
@@ -3684,7 +3704,7 @@ fn descriptor_from_entry(entry: &CacheEntry) -> ArtifactDescriptor {
         media_type: entry.media_type.clone(),
         size_bytes: entry.size_bytes,
         created_at: None,
-        annotations: serde_json::Map::new(),
+        annotations: entry.annotations.clone(),
         manifest_digest: None,
         resolved_via: match entry.source_kind {
             ArtifactSourceKind::Repo => ResolvedVia::RepoMapping,
@@ -5279,6 +5299,7 @@ mod tests {
                 data: payload.to_vec(),
                 digest: Some(digest.clone()),
             }],
+            ..Default::default()
         });
         let component_registry = MockComponentRegistryClient::default();
 
@@ -5323,6 +5344,7 @@ mod tests {
                 data: payload.to_vec(),
                 digest: Some(digest.clone()),
             }],
+            ..Default::default()
         });
 
         let descriptor = client
@@ -5357,6 +5379,7 @@ mod tests {
                 data: payload.to_vec(),
                 digest: Some(digest.clone()),
             }],
+            ..Default::default()
         };
         let resolve_pack_registry = MockPackRegistryClient::with_image(resolved_pack.clone());
         let fetch_pack_registry = MockPackRegistryClient::with_image(resolved_pack);
@@ -5387,6 +5410,119 @@ mod tests {
         assert_eq!(fs::read(&artifact.local_path).unwrap(), payload);
     }
 
+    // C2: a DSSE signature attached as an OCI manifest annotation must survive
+    // resolve -> fetch -> cache persist -> reopen, so a prod policy verifies the
+    // same artifact at stage AND at warm/rollback (the cache-reopen path).
+    #[tokio::test]
+    async fn oci_dsse_annotation_survives_resolve_fetch_and_cache_reopen() {
+        use crate::signing::{
+            InTotoStatement, SlsaProvenance, TrustedKey, key_id_for_public_key_pem, sign_statement,
+        };
+        use ed25519_dalek::SigningKey;
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+        use ed25519_dalek::pkcs8::spki::EncodePublicKey;
+        use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+
+        let temp = tempfile::tempdir().unwrap();
+        let client = DistClient::new(test_dist_options(&temp));
+        let reference = "ghcr.io/greenticai/bundles/customer.support.gtpack:1.2.0";
+        let payload = b"bundle-squashfs-bytes";
+        let digest = compute_bytes_digest(payload);
+        let sha_hex = digest.strip_prefix("sha256:").unwrap_or(&digest);
+
+        // Publisher side: sign the artifact digest and attach the DSSE envelope
+        // as the OCI manifest annotation.
+        let sk = SigningKey::from_bytes(&[42u8; 32]);
+        let priv_pem = sk.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
+        let pub_pem = sk
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let key_id = key_id_for_public_key_pem(&pub_pem).unwrap();
+        let statement = InTotoStatement::provenance(
+            "customer.support.gtbundle",
+            sha_hex,
+            SlsaProvenance {
+                builder_id: "greentic-bundle/test".into(),
+                build_type: "gtbundle".into(),
+                built_at: None,
+                tlog_entry_id: None,
+            },
+        );
+        let envelope = sign_statement(&statement, &priv_pem, &key_id).unwrap();
+        let envelope_b64 = BASE64.encode(serde_json::to_vec(&envelope).unwrap());
+        let mut annotations = std::collections::HashMap::new();
+        annotations.insert(DSSE_ANNOTATION_KEY.to_string(), envelope_b64);
+
+        let image = PackPulledImage {
+            digest: Some(digest.clone()),
+            layers: vec![PackPulledLayer {
+                media_type: "application/vnd.greentic.gtpack.layer.v1+tar".to_string(),
+                data: payload.to_vec(),
+                digest: Some(digest.clone()),
+            }],
+            manifest_annotations: Some(annotations),
+        };
+
+        // Resolve carries the manifest annotation into the descriptor.
+        let descriptor = client
+            .resolve_oci_descriptor_with_clients(
+                reference,
+                RejectingComponentRegistryClient::default(),
+                MockPackRegistryClient::with_image(image.clone()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            descriptor.annotations.contains_key(DSSE_ANNOTATION_KEY),
+            "resolve must carry the DSSE annotation into the descriptor"
+        );
+
+        // Fetch persists the artifact and its annotations into the cache.
+        let artifact = client
+            .fetch_oci_descriptor_with_pack_client(
+                &descriptor,
+                MockPackRegistryClient::with_image(image),
+            )
+            .await
+            .unwrap();
+
+        let policy = VerificationPolicy {
+            require_signature: true,
+            trusted_keys: vec![TrustedKey {
+                key_id,
+                public_key_pem: pub_pem,
+            }],
+            environment: VerificationEnvironment::Prod,
+            ..Default::default()
+        };
+
+        // Stage-time verification passes against the trust root.
+        let staged = client.verify_artifact(&artifact, None, &policy).unwrap();
+        assert!(
+            staged.passed,
+            "stage-time verify must pass, errors: {:?}",
+            staged.errors
+        );
+
+        // Reopen from cache (the warm/rollback path) and re-verify: the
+        // annotation must survive descriptor_from_entry.
+        let reopened = client.open_cached(&digest).unwrap();
+        assert!(
+            reopened
+                .descriptor
+                .annotations
+                .contains_key(DSSE_ANNOTATION_KEY),
+            "cache reopen must retain the DSSE annotation"
+        );
+        let warmed = client.verify_artifact(&reopened, None, &policy).unwrap();
+        assert!(
+            warmed.passed,
+            "warm/rollback verify must pass, errors: {:?}",
+            warmed.errors
+        );
+    }
+
     #[tokio::test]
     async fn prefetch_release_component_writes_component_cache_entry() {
         let temp = tempfile::tempdir().unwrap();
@@ -5401,6 +5537,7 @@ mod tests {
                 data: payload.to_vec(),
                 digest: Some(digest.clone()),
             }],
+            ..Default::default()
         });
         let pack_registry = MockPackRegistryClient::default();
 
@@ -5652,6 +5789,7 @@ mod tests {
                     data: payload.clone(),
                     digest: Some(digest.clone()),
                 }],
+                ..Default::default()
             },
         };
 

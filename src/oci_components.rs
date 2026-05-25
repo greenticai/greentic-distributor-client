@@ -112,6 +112,8 @@ pub struct ResolvedComponentDescriptor {
     pub size_bytes: u64,
     pub fetched_from_network: bool,
     pub manifest_digest: Option<String>,
+    /// OCI manifest annotations carried from the pull (signature material, etc.).
+    pub manifest_annotations: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -252,6 +254,7 @@ impl<C: RegistryClient> OciComponentResolver<C> {
             .or_else(|| chosen_layer.digest.clone())
             .unwrap_or_else(|| compute_digest(&chosen_layer.data));
         let manifest_digest = image.digest.clone();
+        let manifest_annotations = image.manifest_annotations.clone();
 
         if let Some(expected) = expected_digest.as_ref()
             && expected != &resolved_digest
@@ -270,6 +273,7 @@ impl<C: RegistryClient> OciComponentResolver<C> {
             size_bytes: chosen_layer.data.len() as u64,
             fetched_from_network: true,
             manifest_digest,
+            manifest_annotations,
         })
     }
 
@@ -645,6 +649,10 @@ impl OciCache {
             size_bytes,
             fetched_from_network: false,
             manifest_digest: metadata.and_then(|m| m.manifest_digest),
+            // Cache-hit resolution does not restore manifest annotations (they
+            // are not persisted in the OCI-layer cache metadata); a re-pull or
+            // the dist CacheEntry carries signature material instead.
+            manifest_annotations: None,
         })
     }
 
@@ -731,10 +739,13 @@ fn trim_digest_prefix(digest: &str) -> &str {
         .unwrap_or_else(|| digest.trim_start_matches('@'))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PulledImage {
     pub digest: Option<String>,
     pub layers: Vec<PulledLayer>,
+    /// OCI manifest-level annotations (e.g. a `dev.greentic.dsse` signature).
+    /// Carried through so signature material survives from registry to verifier.
+    pub manifest_annotations: Option<HashMap<String, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -941,6 +952,7 @@ mod tests {
                 image: PulledImage {
                     digest: None,
                     layers: Vec::new(),
+                    ..Default::default()
                 },
             }
         }
@@ -973,6 +985,7 @@ mod tests {
                     digest: None,
                 },
             ],
+            ..Default::default()
         };
         let client = FakeClient { image };
         let opts = ComponentResolveOptions {
@@ -1007,6 +1020,7 @@ mod tests {
             image: PulledImage {
                 digest: None,
                 layers: Vec::new(),
+                ..Default::default()
             },
         };
         let opts_offline = ComponentResolveOptions {
@@ -1045,9 +1059,11 @@ fn convert_image(image: ImageData) -> PulledImage {
             }
         })
         .collect();
+    let manifest_annotations = image.manifest.and_then(|m| m.annotations);
     PulledImage {
         digest: image.digest,
         layers,
+        manifest_annotations,
     }
 }
 

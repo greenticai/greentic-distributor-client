@@ -88,6 +88,7 @@ fn pulled_image(data: &[u8], media_type: &str, digest: &str) -> PulledImage {
             data: data.to_vec(),
             digest: Some(digest.to_string()),
         }],
+        ..Default::default()
     }
 }
 
