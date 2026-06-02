@@ -20,6 +20,7 @@ http-runtime = ["reqwest"]
 oci-components = ["dirs-next", "oci-distribution", "sha2"]
 pack-fetch = ["dirs-next", "oci-distribution", "sha2"]
 runner-api = ["dirs-next", "oci-distribution", "sha2"]
+component-runner = ["oci-components", "wasmtime", "wasmtime-wasi", "ciborium"]
 dist-client = ["oci-components", "reqwest", "pack-fetch"]
 dist-cli = ["clap", "dist-client", "pack-fetch"]
 fixture-resolver = ["dist-client"]
@@ -49,6 +50,9 @@ oci-distribution = { version = "0.11", default-features = false, features = ["ru
 sha2 = { version = "0.11", optional = true }
 dirs-next = { version = "2", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
+wasmtime = { version = "43", features = ["component-model"], optional = true }
+wasmtime-wasi = { version = "43", optional = true }
+ciborium = { version = "0.2", optional = true }
 rpassword = "7"
 [dev-dependencies]
 httpmock = "0.8"
@@ -71,3 +75,8 @@ required-features = ["dist-cli"]
 name = "greentic-distributor-client"
 path = "src/bin/greentic-distributor-client.rs"
 required-features = ["dist-cli"]
+
+[[bin]]
+name = "greentic-component-runner"
+path = "src/bin/greentic-component-runner.rs"
+required-features = ["component-runner"]
