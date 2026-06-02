@@ -59,6 +59,12 @@ runner-api = [
     "dirs-next",
     "oci-distribution",
 ]
+component-runner = [
+    "oci-components",
+    "wasmtime",
+    "wasmtime-wasi",
+    "ciborium",
+]
 dist-client = [
     "oci-components",
     "reqwest",
@@ -85,6 +91,9 @@ tempfile = { workspace = true }
 base64 = "0.22"
 hex = "0.4"
 tracing = "0.1"
+wasmtime = { version = "43", features = ["component-model"], optional = true }
+wasmtime-wasi = { version = "43", optional = true }
+ciborium = { version = "0.2", optional = true }
 
 [dependencies.ed25519-dalek]
 version = "2"
@@ -176,4 +185,11 @@ name = "greentic-distributor-client"
 path = "src/bin/greentic-distributor-client.rs"
 required-features = [
     "dist-cli",
+]
+
+[[bin]]
+name = "greentic-component-runner"
+path = "src/bin/greentic-component-runner.rs"
+required-features = [
+    "component-runner",
 ]

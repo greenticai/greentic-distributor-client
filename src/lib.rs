@@ -43,8 +43,8 @@ pub use error::DistributorError;
 pub use http::HttpDistributorClient;
 #[cfg(feature = "oci-components")]
 pub use oci_components::{
-    ComponentResolveOptions, ComponentsExtension, ComponentsMode, OciComponentError,
-    OciComponentResolver, ResolvedComponent, ResolvedComponentDescriptor,
+    ComponentResolveOptions, ComponentsExtension, ComponentsMode, DefaultRegistryClient,
+    OciComponentError, OciComponentResolver, ResolvedComponent, ResolvedComponentDescriptor,
 };
 #[cfg(feature = "pack-fetch")]
 pub use oci_packs::{OciPackError, OciPackFetcher, PackFetchOptions, ResolvedPack};
