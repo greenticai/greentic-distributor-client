@@ -184,9 +184,11 @@ async fn invoke_component(envelope: &ComponentInvocationEnvelope) -> Result<Valu
         .reference
         .strip_prefix("oci://")
         .unwrap_or(&envelope.reference);
-    let mut opts = ComponentResolveOptions::default();
-    opts.allow_tags = true;
-    opts.offline = std::env::var_os("GREENTIC_COMPONENT_RUNNER_OFFLINE").is_some();
+    let opts = ComponentResolveOptions {
+        allow_tags: true,
+        offline: std::env::var_os("GREENTIC_COMPONENT_RUNNER_OFFLINE").is_some(),
+        ..Default::default()
+    };
     let client = registry_client_from_env();
     let resolver: OciComponentResolver<DefaultRegistryClient> =
         OciComponentResolver::with_client(client, opts);
