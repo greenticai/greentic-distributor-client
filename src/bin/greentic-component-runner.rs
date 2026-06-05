@@ -191,9 +191,8 @@ impl WasiView for HostState {
     }
 }
 
-#[tokio::main]
-async fn main() {
-    let result = run().await;
+fn main() {
+    let result = run();
     match result {
         Ok(envelope) => {
             println!(
@@ -220,7 +219,7 @@ async fn main() {
     }
 }
 
-async fn run() -> Result<ComponentInvocationResultEnvelope> {
+fn run() -> Result<ComponentInvocationResultEnvelope> {
     let mut stdin = String::new();
     io::stdin()
         .read_to_string(&mut stdin)
@@ -228,53 +227,61 @@ async fn run() -> Result<ComponentInvocationResultEnvelope> {
     let envelope: ComponentInvocationEnvelope =
         serde_json::from_str(&stdin).context("failed to parse component invocation envelope")?;
 
-    match invoke_component(&envelope).await {
+    match invoke_component(&envelope) {
         Ok(output) => Ok(success_result(&envelope, output)),
         Err(err) => Ok(failed_result(&envelope, format!("{err:#}"))),
     }
 }
 
-async fn invoke_component(envelope: &ComponentInvocationEnvelope) -> Result<Value> {
+fn invoke_component(envelope: &ComponentInvocationEnvelope) -> Result<Value> {
     if envelope.runtime != "wasm_wasi" && envelope.runtime != "WasmWasi" {
         bail!(
             "unsupported component runtime {}; expected wasm_wasi",
             envelope.runtime
         );
     }
-    let reference = envelope
-        .reference
-        .strip_prefix("oci://")
-        .unwrap_or(&envelope.reference);
-    let opts = ComponentResolveOptions {
-        allow_tags: true,
-        offline: std::env::var_os("GREENTIC_COMPONENT_RUNNER_OFFLINE").is_some(),
-        ..Default::default()
-    };
-    let client = registry_client_from_env();
-    let resolver: OciComponentResolver<DefaultRegistryClient> =
-        OciComponentResolver::with_client(client, opts);
-    let resolved = resolver
-        .resolve_refs(&ComponentsExtension {
-            refs: vec![reference.to_owned()],
-            mode: ComponentsMode::Eager,
-        })
-        .await
-        .with_context(|| {
-            format!(
-                "failed to resolve component OCI reference {}",
-                envelope.reference
-            )
-        })?
-        .into_iter()
-        .next()
-        .context("component resolver returned no result")?;
+    let resolved_path = resolve_component_path(envelope)?;
 
-    invoke_wasm(envelope, &resolved.path).with_context(|| {
+    invoke_wasm(envelope, &resolved_path).with_context(|| {
         format!(
             "failed to invoke component {} from {}",
             envelope.component_id,
-            resolved.path.display()
+            resolved_path.display()
         )
+    })
+}
+
+fn resolve_component_path(envelope: &ComponentInvocationEnvelope) -> Result<PathBuf> {
+    let reference = envelope
+        .reference
+        .strip_prefix("oci://")
+        .unwrap_or(&envelope.reference)
+        .to_owned();
+    let component_ref = envelope.reference.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to create component resolver runtime")?;
+    runtime.block_on(async move {
+        let opts = ComponentResolveOptions {
+            allow_tags: true,
+            offline: std::env::var_os("GREENTIC_COMPONENT_RUNNER_OFFLINE").is_some(),
+            ..Default::default()
+        };
+        let client = registry_client_from_env();
+        let resolver: OciComponentResolver<DefaultRegistryClient> =
+            OciComponentResolver::with_client(client, opts);
+        let resolved = resolver
+            .resolve_refs(&ComponentsExtension {
+                refs: vec![reference],
+                mode: ComponentsMode::Eager,
+            })
+            .await
+            .with_context(|| format!("failed to resolve component OCI reference {component_ref}"))?
+            .into_iter()
+            .next()
+            .context("component resolver returned no result")?;
+        Ok(resolved.path)
     })
 }
 
