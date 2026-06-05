@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use greentic_distributor_client::{
@@ -10,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use wasmtime::component::{Component as WasmComponent, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 mod bindings {
     wasmtime::component::bindgen!({
@@ -112,13 +113,73 @@ struct HostState {
     wasi_ctx: WasiCtx,
 }
 
-impl Default for HostState {
-    fn default() -> Self {
-        Self {
-            table: ResourceTable::new(),
-            wasi_ctx: WasiCtxBuilder::new().build(),
+impl HostState {
+    fn new() -> Result<Self> {
+        let mut builder = WasiCtxBuilder::new();
+        for preopen in component_runner_preopens()? {
+            builder
+                .preopened_dir(
+                    &preopen.host_path,
+                    &preopen.guest_path,
+                    DirPerms::READ,
+                    FilePerms::READ,
+                )
+                .map_err(|err| {
+                    anyhow!(
+                        "failed to preopen {} as {}: {err}",
+                        preopen.host_path.display(),
+                        preopen.guest_path
+                    )
+                })?;
         }
+        Ok(Self {
+            table: ResourceTable::new(),
+            wasi_ctx: builder.build(),
+        })
     }
+}
+
+#[derive(Debug)]
+struct PreopenSpec {
+    host_path: PathBuf,
+    guest_path: String,
+}
+
+fn component_runner_preopens() -> Result<Vec<PreopenSpec>> {
+    let Some(raw) = std::env::var("GREENTIC_COMPONENT_RUNNER_PREOPEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+    raw.split([',', ';'])
+        .filter(|entry| !entry.trim().is_empty())
+        .map(parse_preopen_spec)
+        .collect()
+}
+
+fn parse_preopen_spec(entry: &str) -> Result<PreopenSpec> {
+    let (host, guest) = entry.split_once('=').with_context(|| {
+        format!("invalid preopen spec `{entry}`; expected host_path=guest_path")
+    })?;
+    let host_path = PathBuf::from(host.trim());
+    if host_path.as_os_str().is_empty() {
+        bail!("invalid preopen spec `{entry}`: host path is empty");
+    }
+    if !Path::new(&host_path).is_dir() {
+        bail!(
+            "invalid preopen spec `{entry}`: host path {} is not a directory",
+            host_path.display()
+        );
+    }
+    let guest_path = guest.trim();
+    if !guest_path.starts_with('/') {
+        bail!("invalid preopen spec `{entry}`: guest path must be absolute");
+    }
+    Ok(PreopenSpec {
+        host_path,
+        guest_path: guest_path.to_owned(),
+    })
 }
 
 impl WasiView for HostState {
@@ -234,7 +295,7 @@ fn invoke_wasm(
     let mut linker = Linker::new(&engine);
     wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
         .map_err(|err| anyhow!("failed to add WASI p2 linker imports: {err}"))?;
-    let mut store = Store::new(&engine, HostState::default());
+    let mut store = Store::new(&engine, HostState::new()?);
     let bindings = bindings::Component::instantiate(&mut store, &component, &linker)
         .map_err(|err| anyhow!("failed to instantiate greentic component: {err}"))?;
     let node = bindings.greentic_component_node();
