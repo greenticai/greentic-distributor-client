@@ -116,6 +116,12 @@ Commands:
 
 Control cache location with `--cache-dir` or `GREENTIC_DIST_CACHE_DIR`; defaults to `${XDG_CACHE_HOME:-~/.cache}/greentic/components/<sha256>/component.wasm`. Set `GREENTIC_SILENCE_DEPRECATION_WARNINGS=1` to silence the temporary `greentic-distributor-client` shim binary warning.
 
+`greentic-component-runner` supports read-only WASI preopens for components that need mounted data such as Fast2Flow indexes:
+
+```bash
+GREENTIC_COMPONENT_RUNNER_PREOPEN="/host/indexes=/mnt/indexes,/host/registry=/mnt/registry" greentic-component-runner < invocation.json
+```
+
 Exit codes:
 - `0` success
 - `2` invalid input (bad ref/lockfile/missing args)
