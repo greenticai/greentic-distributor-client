@@ -573,7 +573,39 @@ impl RegistryClient for DefaultRegistryClient {
     }
 }
 
+/// Map a set of insecure-registry allowances to the transport protocol. An
+/// empty list keeps the default HTTPS-everywhere behavior; a non-empty list
+/// downgrades exactly those `host[:port]` registries to plain HTTP while HTTPS
+/// stays the default for every other registry.
+fn protocol_for_insecure_registries(insecure_registries: Vec<String>) -> ClientProtocol {
+    if insecure_registries.is_empty() {
+        ClientProtocol::Https
+    } else {
+        ClientProtocol::HttpsExcept(insecure_registries)
+    }
+}
+
 impl DefaultRegistryClient {
+    /// Anonymous client that uses HTTPS for every registry except the listed
+    /// `host[:port]` registries, which are pulled over plain HTTP. An empty
+    /// list is byte-for-byte identical to [`DefaultRegistryClient::default_client`].
+    ///
+    /// Each entry must match the registry exactly as `oci-distribution` parses
+    /// it from the reference (e.g. `localhost:5000`,
+    /// `gtc-oci-registry.gtc-local.svc.cluster.local:5000`). Intended for
+    /// in-cluster / air-gapped registries that terminate plain HTTP; production
+    /// registries stay HTTPS.
+    pub fn with_insecure_registries(insecure_registries: Vec<String>) -> Self {
+        let config = ClientConfig {
+            protocol: protocol_for_insecure_registries(insecure_registries),
+            ..Default::default()
+        };
+        Self {
+            inner: Client::new(config),
+            auth: RegistryClientAuth::Anonymous,
+        }
+    }
+
     pub fn with_basic_auth(username: impl Into<String>, password: impl Into<String>) -> Self {
         let mut client = Self::default_client();
         client.auth = RegistryClientAuth::Basic {
@@ -635,9 +667,29 @@ fn is_generic_tarball_media_type(media_type: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_pack_layer_media_types, extend_accepted_media_types_from_layers,
-        is_generic_tarball_media_type,
+        ClientProtocol, default_pack_layer_media_types, extend_accepted_media_types_from_layers,
+        is_generic_tarball_media_type, protocol_for_insecure_registries,
     };
+
+    #[test]
+    fn empty_insecure_list_keeps_https_default() {
+        assert_eq!(
+            protocol_for_insecure_registries(Vec::new()),
+            ClientProtocol::Https
+        );
+    }
+
+    #[test]
+    fn non_empty_insecure_list_downgrades_only_listed_registries() {
+        let registries = vec![
+            "localhost:5000".to_string(),
+            "gtc-oci-registry.gtc-local.svc.cluster.local:5000".to_string(),
+        ];
+        assert_eq!(
+            protocol_for_insecure_registries(registries.clone()),
+            ClientProtocol::HttpsExcept(registries)
+        );
+    }
 
     #[test]
     fn generic_tarball_media_types_are_allowed() {
