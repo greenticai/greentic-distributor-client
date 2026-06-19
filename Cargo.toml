@@ -50,17 +50,20 @@ http-runtime = [
 oci-components = [
     "dirs-next",
     "oci-distribution",
-    "sha2",
 ]
 pack-fetch = [
     "dirs-next",
     "oci-distribution",
-    "sha2",
 ]
 runner-api = [
     "dirs-next",
     "oci-distribution",
-    "sha2",
+]
+component-runner = [
+    "oci-components",
+    "wasmtime",
+    "wasmtime-wasi",
+    "ciborium",
 ]
 dist-client = [
     "oci-components",
@@ -85,6 +88,19 @@ greentic-config-types = ">=1.1.0-dev, <1.2.0-0"
 semver = "1"
 rpassword = "7"
 tempfile = { workspace = true }
+base64 = "0.22"
+hex = "0.4"
+tracing = "0.1"
+wasmtime = { version = "43", features = ["component-model"], optional = true }
+wasmtime-wasi = { version = "43", optional = true }
+ciborium = { version = "0.2", optional = true }
+
+[dependencies.ed25519-dalek]
+version = "2"
+features = [
+    "pkcs8",
+    "pem",
+]
 
 [dependencies.reqwest]
 version = "0.13"
@@ -138,7 +154,6 @@ optional = true
 
 [dependencies.sha2]
 version = "0.11"
-optional = true
 
 [dependencies.dirs-next]
 version = "2"
@@ -170,4 +185,11 @@ name = "greentic-distributor-client"
 path = "src/bin/greentic-distributor-client.rs"
 required-features = [
     "dist-cli",
+]
+
+[[bin]]
+name = "greentic-component-runner"
+path = "src/bin/greentic-component-runner.rs"
+required-features = [
+    "component-runner",
 ]

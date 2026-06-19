@@ -1,5 +1,6 @@
 pub mod config;
 pub mod error;
+pub mod signing;
 pub mod source;
 pub mod types;
 
@@ -42,8 +43,8 @@ pub use error::DistributorError;
 pub use http::HttpDistributorClient;
 #[cfg(feature = "oci-components")]
 pub use oci_components::{
-    ComponentResolveOptions, ComponentsExtension, ComponentsMode, OciComponentError,
-    OciComponentResolver, ResolvedComponent, ResolvedComponentDescriptor,
+    ComponentResolveOptions, ComponentsExtension, ComponentsMode, DefaultRegistryClient,
+    OciComponentError, OciComponentResolver, ResolvedComponent, ResolvedComponentDescriptor,
 };
 #[cfg(feature = "pack-fetch")]
 pub use oci_packs::{OciPackError, OciPackFetcher, PackFetchOptions, ResolvedPack};
@@ -53,6 +54,12 @@ pub use oci_packs::{
     fetch_pack_to_cache, fetch_pack_to_cache_with_options,
     fetch_pack_to_cache_with_options_and_client, fetch_pack_with_options,
     fetch_pack_with_options_and_client,
+};
+pub use signing::{
+    DSSE_PAYLOAD_TYPE_INTOTO, DsseEnvelope, DsseSignature, INTOTO_STATEMENT_TYPE, InTotoStatement,
+    SLSA_PROVENANCE_PREDICATE_TYPE, SigningError, SlsaProvenance, Subject, TrustRoot, TrustedKey,
+    VerifiedStatement, key_id_for_public_key_pem, sign_statement, verify_artifact_dsse,
+    verify_envelope,
 };
 pub use source::{ChainedDistributorSource, DistributorSource};
 pub use store_auth::{

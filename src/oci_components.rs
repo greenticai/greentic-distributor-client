@@ -34,6 +34,9 @@ static DEFAULT_ACCEPTED_MANIFEST_TYPES: &[&str] = &[
 ];
 
 const COMPONENT_MANIFEST_MEDIA_TYPE: &str = "application/vnd.greentic.component.manifest+json";
+const COMPONENT_MANIFEST_V1_MEDIA_TYPE: &str =
+    "application/vnd.greentic.component.manifest.v1+json";
+const COMPONENT_PACKAGE_V1_MEDIA_TYPE: &str = "application/vnd.greentic.component.package.v1+json";
 const GREENTIC_WASM_COMPONENT_MEDIA_TYPE: &str = "application/vnd.greentic.wasm.component";
 const DEFAULT_WASM_FILENAME: &str = "component.wasm";
 
@@ -44,6 +47,8 @@ static DEFAULT_LAYER_MEDIA_TYPES: &[&str] = &[
     GREENTIC_WASM_COMPONENT_MEDIA_TYPE,
     "application/wasm",
     COMPONENT_MANIFEST_MEDIA_TYPE,
+    COMPONENT_MANIFEST_V1_MEDIA_TYPE,
+    COMPONENT_PACKAGE_V1_MEDIA_TYPE,
     "application/octet-stream",
 ];
 
@@ -112,6 +117,8 @@ pub struct ResolvedComponentDescriptor {
     pub size_bytes: u64,
     pub fetched_from_network: bool,
     pub manifest_digest: Option<String>,
+    /// OCI manifest annotations carried from the pull (signature material, etc.).
+    pub manifest_annotations: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -252,6 +259,7 @@ impl<C: RegistryClient> OciComponentResolver<C> {
             .or_else(|| chosen_layer.digest.clone())
             .unwrap_or_else(|| compute_digest(&chosen_layer.data));
         let manifest_digest = image.digest.clone();
+        let manifest_annotations = image.manifest_annotations.clone();
 
         if let Some(expected) = expected_digest.as_ref()
             && expected != &resolved_digest
@@ -270,6 +278,7 @@ impl<C: RegistryClient> OciComponentResolver<C> {
             size_bytes: chosen_layer.data.len() as u64,
             fetched_from_network: true,
             manifest_digest,
+            manifest_annotations,
         })
     }
 
@@ -326,10 +335,10 @@ impl<C: RegistryClient> OciComponentResolver<C> {
             &self.opts.preferred_layer_media_types,
             reference,
         )?;
-        let manifest_layer = image
-            .layers
-            .iter()
-            .find(|layer| layer.media_type == COMPONENT_MANIFEST_MEDIA_TYPE);
+        let manifest_layer = image.layers.iter().find(|layer| {
+            layer.media_type == COMPONENT_MANIFEST_MEDIA_TYPE
+                || layer.media_type == COMPONENT_MANIFEST_V1_MEDIA_TYPE
+        });
         let manifest_wasm_name = if let Some(layer) = manifest_layer {
             manifest_component_wasm_name(&layer.data, reference)?
         } else {
@@ -468,10 +477,10 @@ fn manifest_component_wasm_name(
     if let Some(name) = name.as_deref() {
         let path = std::path::Path::new(name);
         if path.components().count() != 1 {
-            return Err(OciComponentError::InvalidManifestWasmName {
-                reference: reference.to_string(),
-                name: name.to_string(),
-            });
+            // Published component manifests may retain their build-time artifact path
+            // while the OCI package carries the WASM as a dedicated layer. In that
+            // case use the default cache filename for the selected WASM layer.
+            return Ok(None);
         }
     }
     Ok(name)
@@ -521,7 +530,9 @@ impl OciCache {
         manifest_digest: Option<String>,
         manifest_wasm_name: Option<&str>,
     ) -> Result<PathBuf, OciComponentError> {
-        let artifact_path = if media_type == COMPONENT_MANIFEST_MEDIA_TYPE {
+        let artifact_path = if media_type == COMPONENT_MANIFEST_MEDIA_TYPE
+            || media_type == COMPONENT_MANIFEST_V1_MEDIA_TYPE
+        {
             self.write_layer_data(digest, media_type, data, reference)?
         } else if let Some(name) = manifest_wasm_name {
             let path = self.write_named_file(digest, name, data, reference)?;
@@ -645,6 +656,10 @@ impl OciCache {
             size_bytes,
             fetched_from_network: false,
             manifest_digest: metadata.and_then(|m| m.manifest_digest),
+            // Cache-hit resolution does not restore manifest annotations (they
+            // are not persisted in the OCI-layer cache metadata); a re-pull or
+            // the dist CacheEntry carries signature material instead.
+            manifest_annotations: None,
         })
     }
 
@@ -670,7 +685,9 @@ impl OciCache {
         manifest_wasm_name: Option<&str>,
     ) -> PathBuf {
         let dir = self.artifact_dir(digest);
-        let filename = if media_type == COMPONENT_MANIFEST_MEDIA_TYPE {
+        let filename = if media_type == COMPONENT_MANIFEST_MEDIA_TYPE
+            || media_type == COMPONENT_MANIFEST_V1_MEDIA_TYPE
+        {
             "component.manifest.json"
         } else if let Some(name) = manifest_wasm_name {
             name
@@ -731,10 +748,13 @@ fn trim_digest_prefix(digest: &str) -> &str {
         .unwrap_or_else(|| digest.trim_start_matches('@'))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PulledImage {
     pub digest: Option<String>,
     pub layers: Vec<PulledLayer>,
+    /// OCI manifest-level annotations (e.g. a `dev.greentic.dsse` signature).
+    /// Carried through so signature material survives from registry to verifier.
+    pub manifest_annotations: Option<HashMap<String, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -941,6 +961,7 @@ mod tests {
                 image: PulledImage {
                     digest: None,
                     layers: Vec::new(),
+                    ..Default::default()
                 },
             }
         }
@@ -973,6 +994,7 @@ mod tests {
                     digest: None,
                 },
             ],
+            ..Default::default()
         };
         let client = FakeClient { image };
         let opts = ComponentResolveOptions {
@@ -1007,6 +1029,7 @@ mod tests {
             image: PulledImage {
                 digest: None,
                 layers: Vec::new(),
+                ..Default::default()
             },
         };
         let opts_offline = ComponentResolveOptions {
@@ -1045,9 +1068,11 @@ fn convert_image(image: ImageData) -> PulledImage {
             }
         })
         .collect();
+    let manifest_annotations = image.manifest.and_then(|m| m.annotations);
     PulledImage {
         digest: image.digest,
         layers,
+        manifest_annotations,
     }
 }
 
