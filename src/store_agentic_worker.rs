@@ -11,8 +11,9 @@
 //! `store://<name>@<version>` and resolving the store base URL from the
 //! environment) stays in the caller (the bundle auto-wiring pass).
 //!
-//! Ed25519/DSSE signature verification is a separate, later task; this module
-//! performs sha256 integrity checking + caching only.
+//! [`fetch_store_agentic_worker`] performs sha256 integrity checking + caching.
+//! [`fetch_store_agentic_worker_verified`] extends that with Ed25519/DSSE
+//! signature verification using a [`crate::signing::TrustRoot`].
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -82,6 +83,88 @@ pub fn fetch_store_agentic_worker(
     // Cache keyed by archive sha256 (+ ref-keyed copy for offline reuse).
     cache_store_artifact(cache_dir, name, version, &actual_sha, &bytes)?;
     Ok(bytes)
+}
+
+/// Fetch (and cache) the agentic-worker `.gtpack` from the store, then verify its
+/// Ed25519/DSSE signature before returning the bytes.
+///
+/// This extends [`fetch_store_agentic_worker`] with a second HTTP call that
+/// retrieves the version-metadata JSON (`GET {base}/api/v1/agentic-workers/{name}/{version}`)
+/// and extracts the optional `dsseEnvelope` field. The envelope's subject must pin
+/// the same sha256 as the downloaded artifact.
+///
+/// # Trust behaviour
+///
+/// | `trust` | `dsseEnvelope` in metadata | Result |
+/// |---------|---------------------------|--------|
+/// | empty   | any                        | sha256-only; verification skipped (fail-open); metadata endpoint is **not** called |
+/// | non-empty | present                 | DSSE signature verified; bail on any mismatch |
+/// | non-empty | absent                  | bail (fail-closed: operator configured trust but store served no signature) |
+///
+/// # Arguments
+/// * `store_base` - Store base URL (e.g. `https://store.greentic.cloud`).
+/// * `name` - Agentic-worker name.
+/// * `version` - Pinned version.
+/// * `cache_dir` - Runtime cache root; artifacts land under `cache_dir/agentic-workers/`.
+/// * `offline` - When true, never hit the network; serve only from cache.
+/// * `trust` - Explicit allowlist of trusted signing keys. Empty → sha256-only.
+///
+/// # Errors
+/// In addition to [`fetch_store_agentic_worker`] errors: fails when a non-empty
+/// trust root is configured and either the store serves no DSSE envelope for this
+/// version or the signature does not verify against any trusted key.
+pub fn fetch_store_agentic_worker_verified(
+    store_base: &str,
+    name: &str,
+    version: &str,
+    cache_dir: &Path,
+    offline: bool,
+    trust: &crate::signing::TrustRoot,
+) -> Result<Vec<u8>> {
+    let bytes = fetch_store_agentic_worker(store_base, name, version, cache_dir, offline)?;
+
+    if trust.is_empty() {
+        tracing::debug!(
+            name = name,
+            version = version,
+            "signature verification skipped for store agentic worker '{name}@{version}': \
+             no trusted keys configured (sha256-only mode)"
+        );
+        return Ok(bytes);
+    }
+
+    // Fetch version-metadata to retrieve the DSSE envelope.
+    let base = store_base.trim_end_matches('/');
+    let metadata_url = format!("{base}/api/v1/agentic-workers/{name}/{version}");
+    let metadata = http_get_json(&metadata_url).with_context(|| {
+        format!("fetch version metadata for store agentic worker '{name}@{version}'")
+    })?;
+
+    let dsse_envelope_str = metadata
+        .get("dsseEnvelope")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+
+    match dsse_envelope_str {
+        None => {
+            bail!(
+                "signature verification failed for store agentic worker '{name}@{version}': \
+                 trust root is configured but the store served no DSSE envelope — \
+                 ensure the pack was (re-)published after Ed25519 signing was enabled"
+            );
+        }
+        Some(envelope_json) => {
+            let artifact_sha = hex::encode(Sha256::digest(&bytes));
+            crate::signing::verify_artifact_dsse(envelope_json.as_bytes(), &artifact_sha, trust)
+                .map_err(|e| {
+                    anyhow!(
+                        "DSSE signature verification failed for store agentic worker \
+                     '{name}@{version}': {e}"
+                    )
+                })?;
+            Ok(bytes)
+        }
+    }
 }
 
 /// Directory under the runtime cache where store agentic-worker artifacts are kept.
@@ -157,6 +240,36 @@ fn http_get_artifact(url: &str) -> Result<(Vec<u8>, Option<String>)> {
     })
     .join()
     .map_err(|_| anyhow!("store artifact download thread panicked"))?
+}
+
+/// Blocking HTTP GET of a JSON endpoint, returning the parsed `serde_json::Value`.
+///
+/// Runs `reqwest::blocking` on a dedicated thread so it is safe to call from
+/// within a Tokio runtime.
+fn http_get_json(url: &str) -> Result<serde_json::Value> {
+    let url = url.to_string();
+    std::thread::spawn(move || -> Result<serde_json::Value> {
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("build HTTP client for store version metadata")?;
+        let response = client
+            .get(&url)
+            .send()
+            .with_context(|| format!("request store version metadata {url}"))?;
+        if response.status() != reqwest::StatusCode::OK {
+            bail!(
+                "store version metadata {url} request failed with status {}",
+                response.status()
+            );
+        }
+        response
+            .json::<serde_json::Value>()
+            .with_context(|| format!("parse store version metadata response {url}"))
+    })
+    .join()
+    .map_err(|_| anyhow!("store version metadata fetch thread panicked"))?
 }
 
 #[cfg(test)]
