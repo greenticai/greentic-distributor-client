@@ -1583,7 +1583,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-distributor-client"
-version = "1.1.0-dev.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1619,7 +1619,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-distributor-dev"
-version = "1.1.0-dev.0"
+version = "1.1.0"
 dependencies = [
  "greentic-distributor-client",
  "tempfile",
