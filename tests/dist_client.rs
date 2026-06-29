@@ -4,11 +4,11 @@
 use async_trait::async_trait;
 use greentic_distributor_client::dist::{
     AccessMode, AdvisorySet, ArtifactSource, ArtifactSourceKind, BundleLifecycleState, CachePolicy,
-    DistClient, DistOptions, InjectedResolution, ReleaseChannel, ReleaseIndex, ReleaseIndexEntry,
-    ReleaseResolutionContext, ResolvePolicy, ResolveRefInjector, RetentionDecision,
-    RetentionDisposition, RetentionEnvironment, RetentionInput, RollbackBundleInput,
-    StageBundleInput, VerificationEnvironment, VerificationPolicy, WarmBundleInput,
-    is_mutable_release_tag,
+    DistClient, DistError, DistOptions, InjectedResolution, ReleaseChannel, ReleaseIndex,
+    ReleaseIndexEntry, ReleaseResolutionContext, ResolvePolicy, ResolveRefInjector,
+    RetentionDecision, RetentionDisposition, RetentionEnvironment, RetentionInput,
+    RollbackBundleInput, StageBundleInput, VerificationEnvironment, VerificationPolicy,
+    WarmBundleInput, is_mutable_release_tag,
 };
 use greentic_distributor_client::{
     ArtifactOpenOutput, ArtifactOpenRequest, ArtifactOpener, BundleManifestSummary, BundleOpenMode,
@@ -1587,8 +1587,12 @@ async fn pr04_inactive_bundle_state_allows_automatic_cap_eviction() {
         )
         .await
         .unwrap();
+    // A5: `Staged → Inactive` is not on the lifecycle matrix. `Archived` is
+    // the right marker for "this bundle is no longer referenced and may be
+    // evicted under capacity pressure" — `apply_retention` only protects
+    // `Staged | Warming | Ready | Draining`, so any terminal state suffices.
     client
-        .set_bundle_state(&first.bundle_id, BundleLifecycleState::Inactive)
+        .set_bundle_state(&first.bundle_id, BundleLifecycleState::Archived)
         .unwrap();
 
     let second = client
@@ -1610,6 +1614,115 @@ async fn pr04_inactive_bundle_state_allows_automatic_cap_eviction() {
 
     assert!(client.stat_bundle(&first.bundle_id).is_err());
     assert!(client.stat_bundle(&second.bundle_id).is_ok());
+}
+
+/// A5: `set_bundle_state` validates the requested transition against the
+/// spec matrix and refuses anything off-matrix without mutating the on-disk
+/// record. Recovery: a valid follow-up call still succeeds.
+#[tokio::test]
+async fn a5_set_bundle_state_rejects_invalid_transition_and_preserves_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let client = DistClient::new(options(&temp));
+
+    let bundle_path = temp.path().join("a5-bundle.wasm");
+    fs::write(&bundle_path, b"a5-bundle").unwrap();
+    let staged = client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: bundle_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+
+    // `Staged → Ready` is two hops off the matrix (skips `Warming`).
+    let err = client
+        .set_bundle_state(&staged.bundle_id, BundleLifecycleState::Ready)
+        .unwrap_err();
+    match err {
+        DistError::InvalidLifecycleTransition {
+            bundle_id,
+            from,
+            to,
+        } => {
+            assert_eq!(bundle_id, staged.bundle_id);
+            assert_eq!(from, BundleLifecycleState::Staged);
+            assert_eq!(to, BundleLifecycleState::Ready);
+        }
+        other => panic!("expected InvalidLifecycleTransition, got `{other:?}`"),
+    }
+
+    // The on-disk record is unchanged after the rejection.
+    let after = client.stat_bundle(&staged.bundle_id).unwrap();
+    assert_eq!(after.lifecycle_state, BundleLifecycleState::Staged);
+
+    // The legal next hop still succeeds and persists.
+    let warming = client
+        .set_bundle_state(&staged.bundle_id, BundleLifecycleState::Warming)
+        .unwrap();
+    assert_eq!(warming.lifecycle_state, BundleLifecycleState::Warming);
+    assert_eq!(
+        client
+            .stat_bundle(&staged.bundle_id)
+            .unwrap()
+            .lifecycle_state,
+        BundleLifecycleState::Warming
+    );
+}
+
+/// A5: the full happy-path chain `Staged → Warming → Ready → Draining → Inactive → Staged`
+/// drives the record through every "active" lifecycle state with atomic
+/// persistence at each step.
+#[tokio::test]
+async fn a5_set_bundle_state_drives_full_active_chain() {
+    let temp = tempfile::tempdir().unwrap();
+    let client = DistClient::new(options(&temp));
+
+    let bundle_path = temp.path().join("a5-chain.wasm");
+    fs::write(&bundle_path, b"a5-chain").unwrap();
+    let staged = client
+        .stage_bundle(
+            &StageBundleInput {
+                bundle_ref: bundle_path.to_string_lossy().to_string(),
+                requested_access_mode: AccessMode::Userspace,
+                verification_policy_ref: "default".to_string(),
+                cache_policy_ref: "default".to_string(),
+                tenant: None,
+                team: None,
+            },
+            None,
+            &VerificationPolicy::default(),
+            CachePolicy,
+        )
+        .await
+        .unwrap();
+
+    for next in [
+        BundleLifecycleState::Warming,
+        BundleLifecycleState::Ready,
+        BundleLifecycleState::Draining,
+        BundleLifecycleState::Inactive,
+        BundleLifecycleState::Staged,
+    ] {
+        let updated = client.set_bundle_state(&staged.bundle_id, next).unwrap();
+        assert_eq!(updated.lifecycle_state, next);
+        // Each step survives a fresh stat (round-trips through disk).
+        assert_eq!(
+            client
+                .stat_bundle(&staged.bundle_id)
+                .unwrap()
+                .lifecycle_state,
+            next
+        );
+    }
 }
 
 #[tokio::test]

@@ -126,6 +126,8 @@ pub struct ResolvedPack {
     pub path: PathBuf,
     pub fetched_from_network: bool,
     pub manifest_digest: Option<String>,
+    /// OCI manifest annotations carried from the pull (signature material, etc.).
+    pub manifest_annotations: Option<HashMap<String, String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -137,6 +139,10 @@ struct CacheMetadata {
     size_bytes: u64,
     #[serde(default)]
     manifest_digest: Option<String>,
+    /// OCI manifest annotations (signature material, etc.), persisted so a
+    /// cache-hit resolution restores them rather than dropping them.
+    #[serde(default)]
+    manifest_annotations: Option<HashMap<String, String>>,
 }
 
 /// Fetch OCI packs with caching and offline support.
@@ -235,6 +241,7 @@ impl<C: RegistryClient> OciPackFetcher<C> {
             .or_else(|| chosen_layer.digest.clone())
             .unwrap_or_else(|| compute_digest(&chosen_layer.data));
         let manifest_digest = image.digest.clone();
+        let manifest_annotations = image.manifest_annotations.clone();
 
         if let Some(expected) = expected_digest.as_ref()
             && expected != &resolved_digest
@@ -252,6 +259,7 @@ impl<C: RegistryClient> OciPackFetcher<C> {
             &chosen_layer.data,
             reference,
             manifest_digest.clone(),
+            manifest_annotations.clone(),
         )?;
 
         Ok(ResolvedPack {
@@ -261,6 +269,7 @@ impl<C: RegistryClient> OciPackFetcher<C> {
             path,
             fetched_from_network: true,
             manifest_digest,
+            manifest_annotations,
         })
     }
 }
@@ -397,6 +406,7 @@ impl PackCache {
         data: &[u8],
         reference: &str,
         manifest_digest: Option<String>,
+        manifest_annotations: Option<HashMap<String, String>>,
     ) -> Result<PathBuf, OciPackError> {
         let dir = self.artifact_dir(digest);
         fs::create_dir_all(&dir).map_err(|source| OciPackError::Io {
@@ -419,6 +429,7 @@ impl PackCache {
                 .as_secs(),
             size_bytes: data.len() as u64,
             manifest_digest,
+            manifest_annotations,
         };
         let metadata_path = dir.join("metadata.json");
         let buf = serde_json::to_vec(&metadata).map_err(|source| OciPackError::Serde {
@@ -444,13 +455,16 @@ impl PackCache {
         if !path.exists() {
             return None;
         }
+        let manifest_digest = metadata.as_ref().and_then(|m| m.manifest_digest.clone());
+        let manifest_annotations = metadata.and_then(|m| m.manifest_annotations);
         Some(ResolvedPack {
             original_reference: reference.to_string(),
             resolved_digest: digest.to_string(),
             media_type,
             path,
             fetched_from_network: false,
-            manifest_digest: metadata.and_then(|m| m.manifest_digest),
+            manifest_digest,
+            manifest_annotations,
         })
     }
 
@@ -489,10 +503,12 @@ fn trim_digest_prefix(digest: &str) -> &str {
         .unwrap_or_else(|| digest.trim_start_matches('@'))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PulledImage {
     pub digest: Option<String>,
     pub layers: Vec<PulledLayer>,
+    /// OCI manifest-level annotations (e.g. a `dev.greentic.dsse` signature).
+    pub manifest_annotations: Option<HashMap<String, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -573,7 +589,39 @@ impl RegistryClient for DefaultRegistryClient {
     }
 }
 
+/// Map a set of insecure-registry allowances to the transport protocol. An
+/// empty list keeps the default HTTPS-everywhere behavior; a non-empty list
+/// downgrades exactly those `host[:port]` registries to plain HTTP while HTTPS
+/// stays the default for every other registry.
+fn protocol_for_insecure_registries(insecure_registries: Vec<String>) -> ClientProtocol {
+    if insecure_registries.is_empty() {
+        ClientProtocol::Https
+    } else {
+        ClientProtocol::HttpsExcept(insecure_registries)
+    }
+}
+
 impl DefaultRegistryClient {
+    /// Anonymous client that uses HTTPS for every registry except the listed
+    /// `host[:port]` registries, which are pulled over plain HTTP. An empty
+    /// list is byte-for-byte identical to [`DefaultRegistryClient::default_client`].
+    ///
+    /// Each entry must match the registry exactly as `oci-distribution` parses
+    /// it from the reference (e.g. `localhost:5000`,
+    /// `gtc-oci-registry.gtc-local.svc.cluster.local:5000`). Intended for
+    /// in-cluster / air-gapped registries that terminate plain HTTP; production
+    /// registries stay HTTPS.
+    pub fn with_insecure_registries(insecure_registries: Vec<String>) -> Self {
+        let config = ClientConfig {
+            protocol: protocol_for_insecure_registries(insecure_registries),
+            ..Default::default()
+        };
+        Self {
+            inner: Client::new(config),
+            auth: RegistryClientAuth::Anonymous,
+        }
+    }
+
     pub fn with_basic_auth(username: impl Into<String>, password: impl Into<String>) -> Self {
         let mut client = Self::default_client();
         client.auth = RegistryClientAuth::Basic {
@@ -635,9 +683,29 @@ fn is_generic_tarball_media_type(media_type: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_pack_layer_media_types, extend_accepted_media_types_from_layers,
-        is_generic_tarball_media_type,
+        ClientProtocol, default_pack_layer_media_types, extend_accepted_media_types_from_layers,
+        is_generic_tarball_media_type, protocol_for_insecure_registries,
     };
+
+    #[test]
+    fn empty_insecure_list_keeps_https_default() {
+        assert_eq!(
+            protocol_for_insecure_registries(Vec::new()),
+            ClientProtocol::Https
+        );
+    }
+
+    #[test]
+    fn non_empty_insecure_list_downgrades_only_listed_registries() {
+        let registries = vec![
+            "localhost:5000".to_string(),
+            "gtc-oci-registry.gtc-local.svc.cluster.local:5000".to_string(),
+        ];
+        assert_eq!(
+            protocol_for_insecure_registries(registries.clone()),
+            ClientProtocol::HttpsExcept(registries)
+        );
+    }
 
     #[test]
     fn generic_tarball_media_types_are_allowed() {
@@ -688,9 +756,11 @@ fn convert_image(image: ImageData) -> PulledImage {
             }
         })
         .collect();
+    let manifest_annotations = image.manifest.and_then(|m| m.annotations);
     PulledImage {
         digest: image.digest,
         layers,
+        manifest_annotations,
     }
 }
 
