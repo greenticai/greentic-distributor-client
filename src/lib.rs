@@ -16,6 +16,8 @@ pub mod oci_components;
 pub mod oci_packs;
 #[cfg(feature = "runner-api")]
 pub mod runner_api;
+#[cfg(feature = "dist-client")]
+pub mod store_agentic_worker;
 pub mod store_auth;
 #[cfg(feature = "dist-client")]
 pub mod store_ext;
