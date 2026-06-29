@@ -17,6 +17,8 @@ pub mod oci_packs;
 #[cfg(feature = "runner-api")]
 pub mod runner_api;
 pub mod store_auth;
+#[cfg(feature = "dist-client")]
+pub mod store_ext;
 mod wit_client;
 
 pub use config::DistributorClientConfig;
