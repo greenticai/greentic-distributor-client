@@ -84,7 +84,7 @@ async-trait = "0.1"
 serde_json = "1"
 thiserror = "2"
 anyhow = "1"
-greentic-config-types = ">=1.1.0-dev, <1.2.0-0"
+greentic-config-types = ">=1.1.0-0, <1.2.0-0"
 semver = "1"
 rpassword = "7"
 tempfile = { workspace = true }
@@ -127,20 +127,20 @@ features = [
 ]
 
 [dependencies.greentic-types]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-0, <1.2.0-0"
 features = [
     "schema",
 ]
 
 [dependencies.greentic-interfaces-guest]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-0, <1.2.0-0"
 features = [
     "distributor-api",
     "distributor-api-imports",
 ]
 
 [dependencies.greentic-secrets-lib]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-0, <1.2.0-0"
 features = [
     "providers-dev",
 ]
