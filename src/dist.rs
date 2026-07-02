@@ -632,6 +632,17 @@ impl<T: BundleOpener + ?Sized> ArtifactOpener for T {
     }
 }
 
+/// Basic-auth credential for a raw OCI registry host (e.g. a private
+/// `ghcr.io` package). Matched against the ref's registry host; a
+/// non-matching host never receives the token. GHCR: `token` is a PAT,
+/// `username` any non-empty value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OciRegistryCredential {
+    pub host: String,
+    pub username: String,
+    pub token: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct DistOptions {
     pub cache_dir: PathBuf,
@@ -643,6 +654,9 @@ pub struct DistOptions {
     pub store_registry_base: Option<String>,
     pub store_auth_path: PathBuf,
     pub store_state_path: PathBuf,
+    /// Per-registry-host basic-auth for raw `oci://` refs. Empty = anonymous
+    /// (unchanged default). Consulted by resolve + fetch of bare-OCI refs.
+    pub oci_credentials: Vec<OciRegistryCredential>,
     #[cfg(feature = "fixture-resolver")]
     pub fixture_dir: Option<PathBuf>,
 }
@@ -670,6 +684,7 @@ impl Default for DistOptions {
             store_registry_base: std::env::var("GREENTIC_STORE_REGISTRY_BASE").ok(),
             store_auth_path: default_store_auth_path(),
             store_state_path: default_store_state_path(),
+            oci_credentials: Vec::new(),
             #[cfg(feature = "fixture-resolver")]
             fixture_dir: std::env::var("GREENTIC_FIXTURE_DIR")
                 .ok()
