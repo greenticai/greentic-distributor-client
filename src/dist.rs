@@ -1323,8 +1323,8 @@ impl DistClient {
     ) -> Result<ArtifactDescriptor, DistError> {
         self.resolve_oci_descriptor_with_clients(
             reference,
-            ComponentRegistryClient::default(),
-            PackRegistryClient::default(),
+            self.oci_component_client_for(reference),
+            self.oci_pack_client_for(reference),
         )
         .await
     }
