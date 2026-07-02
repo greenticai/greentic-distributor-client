@@ -1529,6 +1529,36 @@ impl DistClient {
         Ok(Some(descriptor))
     }
 
+    /// Registry host of a raw OCI ref (scheme-tolerant), e.g. "ghcr.io".
+    fn oci_ref_registry_host(reference: &str) -> Option<String> {
+        let trimmed = reference.trim_start_matches("oci://");
+        Reference::try_from(trimmed)
+            .ok()
+            .map(|r| r.registry().to_string())
+    }
+
+    /// The credential whose host matches this ref's registry, if any.
+    fn oci_credential_for(&self, reference: &str) -> Option<&OciRegistryCredential> {
+        let host = Self::oci_ref_registry_host(reference)?;
+        self.opts.oci_credentials.iter().find(|c| c.host == host)
+    }
+
+    /// Auth-selected component client for a bare-OCI ref (Anonymous when no match).
+    fn oci_component_client_for(&self, reference: &str) -> ComponentRegistryClient {
+        match self.oci_credential_for(reference) {
+            Some(c) => ComponentRegistryClient::with_basic_auth(c.username.clone(), c.token.clone()),
+            None => ComponentRegistryClient::default(),
+        }
+    }
+
+    /// Auth-selected pack client for a bare-OCI ref.
+    fn oci_pack_client_for(&self, reference: &str) -> PackRegistryClient {
+        match self.oci_credential_for(reference) {
+            Some(c) => PackRegistryClient::with_basic_auth(c.username.clone(), c.token.clone()),
+            None => PackRegistryClient::default(),
+        }
+    }
+
     async fn load_store_credentials(&self, tenant: &str) -> Result<StoreCredentials, DistError> {
         load_login(
             &self.opts.store_auth_path,
@@ -5265,9 +5295,33 @@ mod tests {
             store_registry_base: None,
             store_auth_path: temp.path().join("store-auth.json"),
             store_state_path: temp.path().join("store-auth.json"),
+            oci_credentials: Vec::new(),
             #[cfg(feature = "fixture-resolver")]
             fixture_dir: None,
         }
+    }
+
+    #[test]
+    fn oci_credential_matches_by_registry_host() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut opts = test_dist_options(&temp);
+        opts.oci_credentials = vec![OciRegistryCredential {
+            host: "ghcr.io".into(),
+            username: "u".into(),
+            token: "t".into(),
+        }];
+        let client = DistClient::new(opts);
+        assert!(
+            client
+                .oci_credential_for("ghcr.io/greentic-biz/components/aws-workspace:1.1.0")
+                .is_some()
+        );
+        assert!(
+            client
+                .oci_credential_for("docker.io/library/alpine:3")
+                .is_none()
+        );
+        assert!(client.oci_credential_for("oci://ghcr.io/x/y:1").is_some());
     }
 
     #[derive(Clone, Default)]
