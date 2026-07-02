@@ -43,6 +43,7 @@ fn options(dir: &TempDir) -> DistOptions {
         store_registry_base: None,
         store_auth_path: dir.path().join("store-auth.json"),
         store_state_path: dir.path().join("store-auth.json"),
+        oci_credentials: Vec::new(),
         #[cfg(feature = "fixture-resolver")]
         fixture_dir: None,
     }
