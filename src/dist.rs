@@ -1546,7 +1546,9 @@ impl DistClient {
     /// Auth-selected component client for a bare-OCI ref (Anonymous when no match).
     fn oci_component_client_for(&self, reference: &str) -> ComponentRegistryClient {
         match self.oci_credential_for(reference) {
-            Some(c) => ComponentRegistryClient::with_basic_auth(c.username.clone(), c.token.clone()),
+            Some(c) => {
+                ComponentRegistryClient::with_basic_auth(c.username.clone(), c.token.clone())
+            }
             None => ComponentRegistryClient::default(),
         }
     }
@@ -2874,52 +2876,13 @@ impl DistClient {
                 reference: reference.to_string(),
             });
         }
-        let result = self
-            .oci
-            .resolve_refs(&crate::oci_components::ComponentsExtension {
-                refs: vec![reference.to_string()],
-                mode: crate::oci_components::ComponentsMode::Eager,
-            })
-            .await
-            .map_err(DistError::Oci)?;
-        let resolved = result
-            .into_iter()
-            .next()
-            .ok_or_else(|| DistError::InvalidRef {
-                reference: reference.to_string(),
-            })?;
-        let resolved_digest = resolved.resolved_digest.clone();
-        let resolved_bytes = fs::read(&resolved.path).map_err(|source| DistError::CacheError {
-            path: resolved.path.display().to_string(),
+        self.pull_oci_with_source_and_client(
+            reference,
             source,
-        })?;
-        let resolved = ResolvedArtifact::from_path(
-            resolved_digest.clone(),
-            self.cache
-                .write_component(&resolved_digest, &resolved_bytes)
-                .map_err(|source| DistError::CacheError {
-                    path: self
-                        .cache
-                        .component_path(&resolved_digest)
-                        .display()
-                        .to_string(),
-                    source,
-                })?,
-            resolve_component_id_from_cache(&resolved.path, &component_id),
-            resolve_abi_version_from_cache(&resolved.path),
-            resolve_describe_artifact_ref_from_cache(&resolved.path),
-            file_size_if_exists(&resolved.path),
-            Some(normalize_content_type(
-                Some(&resolved.media_type),
-                WASM_CONTENT_TYPE,
-            )),
-            resolved.fetched_from_network,
-            source,
-        );
-        self.persist_cache_entry(&resolved)?;
-        self.enforce_cache_cap(Some(&resolved.descriptor.digest))?;
-        resolved.validate_payload()?;
-        Ok(resolved)
+            component_id,
+            self.oci_component_client_for(reference),
+        )
+        .await
     }
 
     async fn resolve_repo_ref(&self, target: &str) -> Result<ResolvedArtifact, DistError> {
