@@ -8,6 +8,7 @@
   },
   "exclusions": {
     "files": [
+      "src/bin/greentic-component-runner.rs",
       "src/bin/greentic-dist.rs",
       "src/bin/greentic-distributor-client.rs",
       "src/dist_cli.rs",
