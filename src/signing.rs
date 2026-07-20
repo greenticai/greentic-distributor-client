@@ -152,11 +152,20 @@ impl InTotoStatement {
 }
 
 /// A public key trusted to sign artifacts, addressed by [`key_id_for_public_key_pem`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustedKey {
     pub key_id: String,
     /// Ed25519 public key as SPKI PEM (`-----BEGIN PUBLIC KEY-----`).
     pub public_key_pem: String,
+    /// Where this key was resolved from (e.g. `"did:web:trust.greentic.cloud"`).
+    /// `None` = added by hand or by operator bootstrap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Forward-compatibility: captures unknown fields so that an older binary
+    /// performing read-modify-write on `trust-root.json` does not silently
+    /// strip fields it does not know about.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Explicit allowlist of trusted signing keys. Verification requires at least
@@ -409,6 +418,7 @@ mod tests {
         let trust = TrustRoot::new(vec![TrustedKey {
             key_id: key_id.clone(),
             public_key_pem: pub_pem,
+            ..Default::default()
         }]);
         let bytes = serde_json::to_vec(&env).unwrap();
         let verified = verify_artifact_dsse(&bytes, DIGEST, &trust).unwrap();
@@ -427,6 +437,7 @@ mod tests {
         let trust = TrustRoot::new(vec![TrustedKey {
             key_id,
             public_key_pem: pub_pem,
+            ..Default::default()
         }]);
         let bytes = serde_json::to_vec(&env).unwrap();
         verify_artifact_dsse(&bytes, &format!("sha256:{DIGEST}"), &trust).unwrap();
@@ -441,6 +452,7 @@ mod tests {
         let trust = TrustRoot::new(vec![TrustedKey {
             key_id: other_id,
             public_key_pem: other_pub,
+            ..Default::default()
         }]);
         let bytes = serde_json::to_vec(&env).unwrap();
         assert!(matches!(
@@ -462,6 +474,7 @@ mod tests {
         let trust = TrustRoot::new(vec![TrustedKey {
             key_id: key_id.clone(),
             public_key_pem: pub_pem,
+            ..Default::default()
         }]);
         let bytes = serde_json::to_vec(&env).unwrap();
         assert!(matches!(
@@ -477,6 +490,7 @@ mod tests {
         let trust = TrustRoot::new(vec![TrustedKey {
             key_id,
             public_key_pem: pub_pem,
+            ..Default::default()
         }]);
         let bytes = serde_json::to_vec(&env).unwrap();
         let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -505,6 +519,7 @@ mod tests {
         let trust = TrustRoot::new(vec![TrustedKey {
             key_id,
             public_key_pem: pub_pem,
+            ..Default::default()
         }]);
         let bytes = serde_json::to_vec(&env).unwrap();
         assert!(matches!(
@@ -537,10 +552,12 @@ mod tests {
             TrustedKey {
                 key_id: key_id_a,
                 public_key_pem: pub_a,
+                ..Default::default()
             },
             TrustedKey {
                 key_id: key_id_b.clone(),
                 public_key_pem: pub_b,
+                ..Default::default()
             },
         ]);
         let bytes = serde_json::to_vec(&env).unwrap();
@@ -558,6 +575,7 @@ mod tests {
         let trust = TrustRoot::new(vec![TrustedKey {
             key_id: key_id.to_ascii_uppercase(),
             public_key_pem: pub_pem,
+            ..Default::default()
         }]);
         let bytes = serde_json::to_vec(&env).unwrap();
         verify_artifact_dsse(&bytes, DIGEST, &trust).unwrap();
@@ -571,6 +589,7 @@ mod tests {
         let trust = TrustRoot::new(vec![TrustedKey {
             key_id: String::new(),
             public_key_pem: pub_pem,
+            ..Default::default()
         }]);
         assert!(trust.find("").is_none());
         assert!(trust.find("anything").is_none());
@@ -586,8 +605,91 @@ mod tests {
         let trust = TrustRoot::new(vec![TrustedKey {
             key_id,
             public_key_pem: pub_pem,
+            ..Default::default()
         }]);
         let bytes = serde_json::to_vec(&env).unwrap();
         verify_artifact_dsse(&bytes, DIGEST, &trust).unwrap();
+    }
+
+    // --- TrustedKey provenance + forward-compat tests ---
+
+    /// A key with `source` set round-trips through serialize/deserialize.
+    #[test]
+    fn trusted_key_source_round_trips() {
+        let key = TrustedKey {
+            key_id: "abc123".into(),
+            public_key_pem: "-----BEGIN PUBLIC KEY-----\ntest\n-----END PUBLIC KEY-----".into(),
+            source: Some("did:web:trust.greentic.cloud".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&key).unwrap();
+        assert!(json.contains(r#""source":"did:web:trust.greentic.cloud"#));
+        let back: TrustedKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.source, Some("did:web:trust.greentic.cloud".into()));
+        assert_eq!(back.key_id, "abc123");
+    }
+
+    /// Today's exact JSON format (no `source`, no extra fields) still
+    /// deserializes correctly — backward compatibility.
+    #[test]
+    fn legacy_json_without_source_deserializes() {
+        let json = r#"{"key_id":"abc123","public_key_pem":"PEM"}"#;
+        let key: TrustedKey = serde_json::from_str(json).unwrap();
+        assert_eq!(key.key_id, "abc123");
+        assert_eq!(key.public_key_pem, "PEM");
+        assert_eq!(key.source, None);
+        assert!(key.extra.is_empty());
+    }
+
+    /// A key with an unknown future field survives a deserialize->serialize
+    /// round trip with the field intact. This is the regression the `flatten`
+    /// exists to prevent: an older binary doing read-modify-write must not
+    /// strip fields it does not know about.
+    #[test]
+    fn unknown_field_survives_round_trip() {
+        let json =
+            r#"{"key_id":"abc123","public_key_pem":"PEM","future_field":"hello","nested":{"a":1}}"#;
+        let key: TrustedKey = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            key.extra.get("future_field").and_then(|v| v.as_str()),
+            Some("hello")
+        );
+        assert!(key.extra.contains_key("nested"));
+        let re_serialized = serde_json::to_string(&key).unwrap();
+        let round: serde_json::Value = serde_json::from_str(&re_serialized).unwrap();
+        assert_eq!(round["future_field"], "hello");
+        assert_eq!(round["nested"]["a"], 1);
+    }
+
+    /// Serialization of a plain key (no source, no extra) is byte-identical
+    /// to the format produced before this change. This file is read by
+    /// binaries in the field; the wire format must not drift.
+    #[test]
+    fn plain_key_serialization_is_byte_identical_to_legacy() {
+        let key = TrustedKey {
+            key_id: "abc123".into(),
+            public_key_pem: "PEM".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&key).unwrap();
+        // Exactly the format an older binary would have produced:
+        assert_eq!(json, r#"{"key_id":"abc123","public_key_pem":"PEM"}"#);
+    }
+
+    /// `TrustRoot::find` is unaffected by the new fields — still matches by
+    /// key_id (case-insensitive) and still rejects empty ids.
+    #[test]
+    fn trust_root_find_works_with_new_fields() {
+        let key = TrustedKey {
+            key_id: "AbCd1234".into(),
+            public_key_pem: "PEM".into(),
+            source: Some("did:web:example.com".into()),
+            ..Default::default()
+        };
+        let root = TrustRoot::new(vec![key]);
+        assert!(root.find("abcd1234").is_some());
+        assert!(root.find("ABCD1234").is_some());
+        assert!(root.find("").is_none());
+        assert!(root.find("other").is_none());
     }
 }

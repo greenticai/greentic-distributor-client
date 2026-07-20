@@ -5572,6 +5572,7 @@ mod tests {
             trusted_keys: vec![TrustedKey {
                 key_id,
                 public_key_pem: pub_pem,
+                ..Default::default()
             }],
             environment: VerificationEnvironment::Prod,
             ..Default::default()
@@ -5984,6 +5985,7 @@ mod signature_c2_tests {
                 vec![TrustedKey {
                     key_id: key_id.clone(),
                     public_key_pem: pub_pem.clone(),
+                    ..Default::default()
                 }],
                 true,
             );
@@ -6001,6 +6003,7 @@ mod signature_c2_tests {
         let trusted = vec![TrustedKey {
             key_id: other_id,
             public_key_pem: other_pub,
+            ..Default::default()
         }];
         assert_eq!(
             check_signature_verified(
@@ -6028,6 +6031,7 @@ mod signature_c2_tests {
             vec![TrustedKey {
                 key_id,
                 public_key_pem: pub_pem,
+                ..Default::default()
             }],
             true,
         );
@@ -6090,6 +6094,7 @@ mod signature_c2_tests {
         let trusted = vec![TrustedKey {
             key_id: key_id.clone(),
             public_key_pem: pub_pem,
+            ..Default::default()
         }];
 
         // Valid signature against a trusted key passes in prod.

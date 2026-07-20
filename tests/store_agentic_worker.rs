@@ -183,6 +183,7 @@ fn verified_valid_signature_returns_bytes() {
     let trust = TrustRoot::new(vec![TrustedKey {
         key_id,
         public_key_pem: pub_pem,
+        ..Default::default()
     }]);
 
     let bytes = fetch_store_agentic_worker_verified(
@@ -237,6 +238,7 @@ fn verified_tampered_signature_bails() {
     let trust = TrustRoot::new(vec![TrustedKey {
         key_id,
         public_key_pem: pub_pem,
+        ..Default::default()
     }]);
 
     let err = fetch_store_agentic_worker_verified(
@@ -329,6 +331,7 @@ fn verified_configured_trust_but_missing_envelope_bails() {
     let trust = TrustRoot::new(vec![TrustedKey {
         key_id,
         public_key_pem: pub_pem,
+        ..Default::default()
     }]);
 
     let err = fetch_store_agentic_worker_verified(
