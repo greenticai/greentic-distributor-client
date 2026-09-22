@@ -10,7 +10,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.3.0-research.4"
+version = "1.2.0-dev.0"
 edition = "2024"
 
 [workspace.dependencies]
@@ -18,7 +18,7 @@ tempfile = "3"
 
 [workspace.dependencies.greentic-distributor-client]
 path = "."
-version = ">=1.3.0-research.4, <1.4.0-0"
+version = ">=1.2.0-dev, <1.3.0-0"
 
 [package]
 name = "greentic-distributor-client"
@@ -144,7 +144,7 @@ features = [
 ]
 
 [dependencies.greentic-secrets-lib]
-version = ">=1.3.0-research.3, <1.4.0-0"
+version = ">=1.2.0-dev, <1.3.0-0"
 features = [
     "providers-dev",
 ]
@@ -206,12 +206,3 @@ path = "src/bin/greentic-component-runner.rs"
 required-features = [
     "component-runner",
 ]
-
-# Research-line chain (greentic-start#595). crates.io publishing is locked
-# fleet-wide, so greentic-secrets 1.3.0-research.3 — the first research-line
-# build carrying develop's `vault::{VaultAuth, VaultBackendConfig,
-# build_backend_with}` — exists only in git. A patch section does not travel
-# into a published crate; consumers carry the same patch at their own root.
-# TO UNWIND once publishing is restored: delete this block, `cargo update`.
-[patch.crates-io]
-greentic-secrets-lib = { git = "https://github.com/greenticai/greentic-secrets", rev = "633934c31a4d0413885bbced87acbc29a03c7b28" }
