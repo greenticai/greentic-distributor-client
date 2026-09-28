@@ -18,6 +18,8 @@ pub mod oci_packs;
 pub mod oci_push;
 #[cfg(feature = "oci-client")]
 pub mod oci_retry;
+#[cfg(any(feature = "pack-fetch", feature = "oci-components"))]
+pub mod oci_transport;
 #[cfg(feature = "runner-api")]
 pub mod runner_api;
 #[cfg(feature = "dist-client")]
