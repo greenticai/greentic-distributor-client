@@ -18,6 +18,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::oci_retry::{RetryPolicy, retry_transient};
+pub use crate::oci_transport::InvalidInsecureRegistry;
+use crate::oci_transport::{
+    RegistryClientAuth, protocol_for_insecure_registries, validate_insecure_registries,
+};
 
 const OCI_ARTIFACT_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.artifact.manifest.v1+json";
 const DOCKER_MANIFEST_MEDIA_TYPE: &str = "application/vnd.docker.distribution.manifest.v2+json";
@@ -847,17 +851,19 @@ pub trait RegistryClient: Send + Sync {
 /// Transport failures are retried per [`RetryPolicy`]; see [`crate::oci_retry`]
 /// for what counts as transient. Test doubles implementing [`RegistryClient`]
 /// are unaffected and keep failing instantly.
+///
+/// Transport and auth are independent axes: layer a plain-HTTP transport onto
+/// an authenticated client with [`Self::with_insecure_transport`] (or its
+/// checked form [`Self::try_with_insecure_transport`]). Plain HTTP is never
+/// inferred; only the registries the caller lists are downgraded.
 #[derive(Clone)]
 pub struct DefaultRegistryClient {
     inner: Client,
     auth: RegistryClientAuth,
     retry: RetryPolicy,
-}
-
-#[derive(Clone, Debug)]
-enum RegistryClientAuth {
-    Anonymous,
-    Basic { username: String, password: String },
+    /// Mirrors the transport baked into `inner`'s `ClientConfig`, which
+    /// `oci_client::Client` does not expose back out.
+    protocol: ClientProtocol,
 }
 
 impl Default for DefaultRegistryClient {
@@ -869,14 +875,16 @@ impl Default for DefaultRegistryClient {
 #[async_trait]
 impl RegistryClient for DefaultRegistryClient {
     fn default_client() -> Self {
+        let protocol = ClientProtocol::Https;
         let config = ClientConfig {
-            protocol: ClientProtocol::Https,
+            protocol: protocol.clone(),
             ..Default::default()
         };
         Self {
             inner: Client::new(config),
             auth: RegistryClientAuth::Anonymous,
             retry: RetryPolicy::from_env(),
+            protocol,
         }
     }
 
@@ -916,12 +924,66 @@ impl RegistryClient for DefaultRegistryClient {
 
 impl DefaultRegistryClient {
     fn registry_auth(&self) -> RegistryAuth {
-        match &self.auth {
-            RegistryClientAuth::Anonymous => RegistryAuth::Anonymous,
-            RegistryClientAuth::Basic { username, password } => {
-                RegistryAuth::Basic(username.clone(), password.clone())
-            }
+        self.auth.to_registry_auth()
+    }
+
+    /// Anonymous client that uses HTTPS for every registry except the listed
+    /// `host[:port]` registries, which are pulled over plain HTTP. An empty
+    /// list is identical to [`RegistryClient::default_client`].
+    pub fn with_insecure_registries(insecure_registries: Vec<String>) -> Self {
+        Self::default_client().with_insecure_transport(insecure_registries)
+    }
+
+    /// Layer a plain-HTTP (or partially plain-HTTP) transport onto this
+    /// client, keeping its credentials and retry policy. Chain it after
+    /// [`Self::with_basic_auth`] to reach a password-protected plain-HTTP
+    /// registry:
+    ///
+    /// ```
+    /// # use greentic_distributor_client::oci_components::DefaultRegistryClient;
+    /// let client = DefaultRegistryClient::with_basic_auth("user", "pass")
+    ///     .with_insecure_transport(vec!["localhost:5000".to_string()]);
+    /// assert!(client.uses_plain_http_for("localhost:5000"));
+    /// ```
+    ///
+    /// An empty list keeps HTTPS everywhere.
+    pub fn with_insecure_transport(mut self, insecure_registries: Vec<String>) -> Self {
+        let protocol = protocol_for_insecure_registries(insecure_registries);
+        let config = ClientConfig {
+            protocol: protocol.clone(),
+            ..Default::default()
+        };
+        self.inner = Client::new(config);
+        self.protocol = protocol;
+        self
+    }
+
+    /// Checked form of [`Self::with_insecure_transport`]: refuses any entry
+    /// that could never match a registry (a URL scheme, a path, userinfo,
+    /// whitespace, or an empty string) instead of silently keeping that
+    /// registry on HTTPS.
+    pub fn try_with_insecure_transport(
+        self,
+        insecure_registries: Vec<String>,
+    ) -> Result<Self, InvalidInsecureRegistry> {
+        validate_insecure_registries(&insecure_registries)?;
+        Ok(self.with_insecure_transport(insecure_registries))
+    }
+
+    /// Whether this client talks plain HTTP to `registry` (a `host[:port]`
+    /// exactly as `oci-client` resolves it from a reference, see
+    /// [`Reference::resolve_registry`]).
+    pub fn uses_plain_http_for(&self, registry: &str) -> bool {
+        match &self.protocol {
+            ClientProtocol::Https => false,
+            ClientProtocol::Http => true,
+            ClientProtocol::HttpsExcept(exceptions) => exceptions.iter().any(|e| e == registry),
         }
+    }
+
+    /// Whether this client presents basic-auth credentials.
+    pub fn has_credentials(&self) -> bool {
+        matches!(self.auth, RegistryClientAuth::Basic { .. })
     }
 
     pub fn with_basic_auth(username: impl Into<String>, password: impl Into<String>) -> Self {
