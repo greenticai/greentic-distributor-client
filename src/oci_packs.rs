@@ -5,17 +5,23 @@ use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use oci_distribution::Reference;
-use oci_distribution::client::{Client, ClientConfig, ClientProtocol, ImageData};
-use oci_distribution::errors::OciDistributionError;
-use oci_distribution::manifest::{
+use oci_client::Reference;
+use oci_client::client::{Client, ClientConfig, ClientProtocol, ImageData};
+use oci_client::errors::OciDistributionError;
+use oci_client::manifest::{
     IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE,
     OCI_IMAGE_MEDIA_TYPE, OciManifest,
 };
-use oci_distribution::secrets::RegistryAuth;
+use oci_client::secrets::RegistryAuth;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+use crate::oci_retry::{RetryPolicy, retry_transient};
+pub use crate::oci_transport::InvalidInsecureRegistry;
+use crate::oci_transport::{
+    RegistryClientAuth, protocol_for_insecure_registries, validate_insecure_registries,
+};
 
 const OCI_ARTIFACT_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.artifact.manifest.v1+json";
 const DOCKER_MANIFEST_MEDIA_TYPE: &str = "application/vnd.docker.distribution.manifest.v2+json";
@@ -34,12 +40,12 @@ static DEFAULT_ACCEPTED_MANIFEST_TYPES: &[&str] = &[
 ];
 
 const PACK_LAYER_MEDIA_TYPE: &str = "application/vnd.greentic.pack+json";
-const PACK_LAYER_MEDIA_TYPE_ZIP: &str = "application/vnd.greentic.gtpack.v1+zip";
+pub(crate) const PACK_LAYER_MEDIA_TYPE_ZIP: &str = "application/vnd.greentic.gtpack.v1+zip";
 const PACK_LAYER_MEDIA_TYPE_ZIP_LEGACY: &str = "application/vnd.greentic.gtpack+zip";
 const PACK_LAYER_MEDIA_TYPE_PACK_ZIP: &str = "application/vnd.greentic.pack+zip";
 const PACK_LAYER_MEDIA_TYPE_GTPACK_TAR: &str = "application/vnd.greentic.gtpack.layer.v1+tar";
 const PACK_LAYER_MEDIA_TYPE_MARKDOWN: &str = "text/markdown";
-const PACK_LAYER_MEDIA_TYPE_OCTET_STREAM: &str = "application/octet-stream";
+pub(crate) const PACK_LAYER_MEDIA_TYPE_OCTET_STREAM: &str = "application/octet-stream";
 const PACK_LAYER_MEDIA_TYPE_JSON: &str = "application/json";
 const PACK_LAYER_MEDIA_TYPE_TAR: &str = "application/vnd.oci.image.layer.v1.tar";
 const PACK_LAYER_MEDIA_TYPE_TAR_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
@@ -351,7 +357,7 @@ fn select_layer<'a>(
     Ok(&layers[best_idx])
 }
 
-fn compute_digest(bytes: &[u8]) -> String {
+pub(crate) fn compute_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let digest = hasher.finalize();
@@ -531,17 +537,28 @@ pub trait RegistryClient: Send + Sync {
     ) -> Result<PulledImage, OciDistributionError>;
 }
 
-/// Registry client backed by `oci-distribution` with HTTPS enforced and anonymous pulls.
+/// Registry client backed by `oci-client` with HTTPS enforced and anonymous pulls.
+///
+/// Transport failures are retried per [`RetryPolicy`]; see [`crate::oci_retry`]
+/// for what counts as transient. Retrying lives here rather than in
+/// [`OciPackFetcher`] so that test doubles implementing [`RegistryClient`] stay
+/// exempt and keep failing instantly.
+///
+/// Transport and auth are independent axes, but [`Self::with_insecure_registries`]
+/// and [`Self::with_basic_auth`] are each a standalone constructor that
+/// hardcodes the OTHER axis (the former always builds `Anonymous` auth, the
+/// latter always builds an all-HTTPS transport), so neither alone can produce
+/// a client that is both authenticated and plain-HTTP. Use
+/// [`Self::with_insecure_transport`] to combine them.
 #[derive(Clone)]
 pub struct DefaultRegistryClient {
     inner: Client,
     auth: RegistryClientAuth,
-}
-
-#[derive(Clone, Debug)]
-enum RegistryClientAuth {
-    Anonymous,
-    Basic { username: String, password: String },
+    retry: RetryPolicy,
+    /// Mirrors the transport baked into `inner`'s `ClientConfig`, which
+    /// `oci_client::Client` does not expose back out. Read by
+    /// [`Self::uses_plain_http_for`].
+    protocol: ClientProtocol,
 }
 
 impl Default for DefaultRegistryClient {
@@ -553,13 +570,16 @@ impl Default for DefaultRegistryClient {
 #[async_trait]
 impl RegistryClient for DefaultRegistryClient {
     fn default_client() -> Self {
+        let protocol = ClientProtocol::Https;
         let config = ClientConfig {
-            protocol: ClientProtocol::Https,
+            protocol: protocol.clone(),
             ..Default::default()
         };
         Self {
             inner: Client::new(config),
             auth: RegistryClientAuth::Anonymous,
+            retry: RetryPolicy::from_env(),
+            protocol,
         }
     }
 
@@ -575,29 +595,13 @@ impl RegistryClient for DefaultRegistryClient {
             .iter()
             .map(|media_type| media_type.as_str())
             .collect::<Vec<_>>();
-        let auth = match &self.auth {
-            RegistryClientAuth::Anonymous => RegistryAuth::Anonymous,
-            RegistryClientAuth::Basic { username, password } => {
-                RegistryAuth::Basic(username.clone(), password.clone())
-            }
-        };
-        let image = self
-            .inner
-            .pull(reference, &auth, accepted_media_type_refs)
-            .await?;
+        let auth = self.registry_auth();
+        let image = retry_transient(self.retry, &reference.to_string(), || {
+            self.inner
+                .pull(reference, &auth, accepted_media_type_refs.clone())
+        })
+        .await?;
         Ok(convert_image(image))
-    }
-}
-
-/// Map a set of insecure-registry allowances to the transport protocol. An
-/// empty list keeps the default HTTPS-everywhere behavior; a non-empty list
-/// downgrades exactly those `host[:port]` registries to plain HTTP while HTTPS
-/// stays the default for every other registry.
-fn protocol_for_insecure_registries(insecure_registries: Vec<String>) -> ClientProtocol {
-    if insecure_registries.is_empty() {
-        ClientProtocol::Https
-    } else {
-        ClientProtocol::HttpsExcept(insecure_registries)
     }
 }
 
@@ -606,19 +610,22 @@ impl DefaultRegistryClient {
     /// `host[:port]` registries, which are pulled over plain HTTP. An empty
     /// list is byte-for-byte identical to [`DefaultRegistryClient::default_client`].
     ///
-    /// Each entry must match the registry exactly as `oci-distribution` parses
+    /// Each entry must match the registry exactly as `oci-client` parses
     /// it from the reference (e.g. `localhost:5000`,
     /// `gtc-oci-registry.gtc-local.svc.cluster.local:5000`). Intended for
     /// in-cluster / air-gapped registries that terminate plain HTTP; production
     /// registries stay HTTPS.
     pub fn with_insecure_registries(insecure_registries: Vec<String>) -> Self {
+        let protocol = protocol_for_insecure_registries(insecure_registries);
         let config = ClientConfig {
-            protocol: protocol_for_insecure_registries(insecure_registries),
+            protocol: protocol.clone(),
             ..Default::default()
         };
         Self {
             inner: Client::new(config),
             auth: RegistryClientAuth::Anonymous,
+            retry: RetryPolicy::from_env(),
+            protocol,
         }
     }
 
@@ -631,6 +638,100 @@ impl DefaultRegistryClient {
         client
     }
 
+    /// Layer a plain-HTTP (or partially plain-HTTP) transport onto a client
+    /// that already has its own auth and retry policy configured, without
+    /// discarding either.
+    ///
+    /// This exists because [`Self::with_insecure_registries`] and
+    /// [`Self::with_basic_auth`] each hardcode the axis the OTHER one owns —
+    /// the former always builds `Anonymous` auth, the latter always builds an
+    /// all-HTTPS transport — so there was previously no way to construct a
+    /// client that is both authenticated and plain-HTTP, which real
+    /// in-cluster / self-hosted registries commonly are. Chain it after
+    /// [`Self::with_basic_auth`]:
+    ///
+    /// ```
+    /// # use greentic_distributor_client::oci_packs::DefaultRegistryClient;
+    /// let client = DefaultRegistryClient::with_basic_auth("user", "pass")
+    ///     .with_insecure_transport(vec!["localhost:5000".to_string()]);
+    /// ```
+    ///
+    /// Semantics of the `insecure_registries` argument are identical to
+    /// [`Self::with_insecure_registries`]: an empty list keeps HTTPS
+    /// everywhere.
+    pub fn with_insecure_transport(mut self, insecure_registries: Vec<String>) -> Self {
+        let protocol = protocol_for_insecure_registries(insecure_registries);
+        let config = ClientConfig {
+            protocol: protocol.clone(),
+            ..Default::default()
+        };
+        self.inner = Client::new(config);
+        self.protocol = protocol;
+        self
+    }
+
+    /// Checked form of [`Self::with_insecure_transport`]: refuses any entry
+    /// that could never match a registry (a URL scheme, a path, userinfo,
+    /// whitespace, or an empty string) instead of silently keeping that
+    /// registry on HTTPS.
+    ///
+    /// This is the constructor to use when the list comes from operator
+    /// configuration: a mistyped entry fails here, naming the entry, rather
+    /// than as a TLS error against a plain-HTTP registry later.
+    ///
+    /// ```
+    /// # use greentic_distributor_client::oci_packs::DefaultRegistryClient;
+    /// let client = DefaultRegistryClient::with_basic_auth("user", "pass")
+    ///     .try_with_insecure_transport(vec!["localhost:5000".to_string()])
+    ///     .expect("bare host:port");
+    /// assert!(client.uses_plain_http_for("localhost:5000"));
+    /// ```
+    pub fn try_with_insecure_transport(
+        self,
+        insecure_registries: Vec<String>,
+    ) -> Result<Self, InvalidInsecureRegistry> {
+        validate_insecure_registries(&insecure_registries)?;
+        Ok(self.with_insecure_transport(insecure_registries))
+    }
+
+    /// Whether this client talks plain HTTP to `registry` (a `host[:port]`
+    /// exactly as `oci-client` resolves it from a reference, see
+    /// [`Reference::resolve_registry`]). Lets a caller that needs plain HTTP
+    /// refuse loudly instead of letting the pull fall back to HTTPS.
+    pub fn uses_plain_http_for(&self, registry: &str) -> bool {
+        match &self.protocol {
+            ClientProtocol::Https => false,
+            ClientProtocol::Http => true,
+            ClientProtocol::HttpsExcept(exceptions) => exceptions.iter().any(|e| e == registry),
+        }
+    }
+
+    /// Whether this client presents basic-auth credentials.
+    pub fn has_credentials(&self) -> bool {
+        matches!(self.auth, RegistryClientAuth::Basic { .. })
+    }
+
+    /// Override the transport retry policy, which otherwise comes from
+    /// [`RetryPolicy::from_env`].
+    pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// The `oci-client` auth for this client's configured credentials.
+    /// Shared by pull and push so the two can never disagree about how a
+    /// credential is presented.
+    pub(crate) fn registry_auth(&self) -> RegistryAuth {
+        self.auth.to_registry_auth()
+    }
+
+    /// The underlying `oci-client` client, for sibling modules that need
+    /// to drive it directly (the push path).
+    #[cfg(feature = "pack-push")]
+    pub(crate) fn inner_client(&self) -> &Client {
+        &self.inner
+    }
+
     async fn expand_accepted_media_types(
         &self,
         reference: &Reference,
@@ -640,13 +741,13 @@ impl DefaultRegistryClient {
             .iter()
             .map(|media_type| (*media_type).to_string())
             .collect::<Vec<_>>();
-        let auth = match &self.auth {
-            RegistryClientAuth::Anonymous => RegistryAuth::Anonymous,
-            RegistryClientAuth::Basic { username, password } => {
-                RegistryAuth::Basic(username.clone(), password.clone())
-            }
-        };
-        let (manifest, _) = self.inner.pull_manifest(reference, &auth).await?;
+        let auth = self.registry_auth();
+        // The manifest HEAD is a separate round trip from the layer pull below
+        // and fails independently, so it needs its own retry.
+        let (manifest, _) = retry_transient(self.retry, &reference.to_string(), || {
+            self.inner.pull_manifest(reference, &auth)
+        })
+        .await?;
         if let OciManifest::Image(image_manifest) = manifest {
             extend_accepted_media_types_from_layers(
                 &mut accepted,
@@ -683,8 +784,9 @@ fn is_generic_tarball_media_type(media_type: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientProtocol, default_pack_layer_media_types, extend_accepted_media_types_from_layers,
-        is_generic_tarball_media_type, protocol_for_insecure_registries,
+        ClientProtocol, DefaultRegistryClient, RegistryAuth, default_pack_layer_media_types,
+        extend_accepted_media_types_from_layers, is_generic_tarball_media_type,
+        protocol_for_insecure_registries,
     };
 
     #[test]
@@ -741,6 +843,71 @@ mod tests {
         );
         assert!(accepted.contains(&"application/vnd.greentic.gtpack.layer.v1+tar".to_string()));
     }
+
+    fn assert_basic_auth(client: &DefaultRegistryClient, expected_user: &str, expected_pass: &str) {
+        match client.registry_auth() {
+            RegistryAuth::Basic(username, password) => {
+                assert_eq!(username, expected_user);
+                assert_eq!(password, expected_pass);
+            }
+            other => panic!("expected Basic auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_insecure_transport_combines_basic_auth_with_a_plain_http_registry() {
+        let registries = vec!["localhost:5000".to_string()];
+        let client = DefaultRegistryClient::with_basic_auth("user", "pass")
+            .with_insecure_transport(registries.clone());
+
+        // Auth survives layering the transport on top of it...
+        assert_basic_auth(&client, "user", "pass");
+        // ...and the transport is the one just layered on, not the all-HTTPS
+        // default `with_basic_auth` started from.
+        assert_eq!(client.protocol, ClientProtocol::HttpsExcept(registries));
+    }
+
+    #[test]
+    fn with_insecure_transport_replaces_a_previously_layered_transport() {
+        // Calling it again (e.g. after re-reading config) must replace the
+        // transport, not accumulate onto it, while still leaving auth alone.
+        let client = DefaultRegistryClient::with_basic_auth("user", "pass")
+            .with_insecure_transport(vec!["registry.internal:5000".to_string()])
+            .with_insecure_transport(vec![
+                "registry.internal:5000".to_string(),
+                "registry-two.internal:5000".to_string(),
+            ]);
+
+        assert_basic_auth(&client, "user", "pass");
+        assert_eq!(
+            client.protocol,
+            ClientProtocol::HttpsExcept(vec![
+                "registry.internal:5000".to_string(),
+                "registry-two.internal:5000".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn with_insecure_registries_stays_anonymous() {
+        // Regression guard: `with_insecure_registries` must keep hardcoding
+        // `Anonymous` auth — only the transport should move.
+        let registries = vec!["localhost:5000".to_string()];
+        let client = DefaultRegistryClient::with_insecure_registries(registries.clone());
+
+        assert!(matches!(client.registry_auth(), RegistryAuth::Anonymous));
+        assert_eq!(client.protocol, ClientProtocol::HttpsExcept(registries));
+    }
+
+    #[test]
+    fn with_basic_auth_stays_all_https() {
+        // Regression guard: `with_basic_auth` must keep hardcoding an
+        // all-HTTPS transport — only the auth should move.
+        let client = DefaultRegistryClient::with_basic_auth("user", "pass");
+
+        assert_basic_auth(&client, "user", "pass");
+        assert_eq!(client.protocol, ClientProtocol::Https);
+    }
 }
 
 fn convert_image(image: ImageData) -> PulledImage {
@@ -751,12 +918,17 @@ fn convert_image(image: ImageData) -> PulledImage {
             let digest = format!("sha256:{}", layer.sha256_digest());
             PulledLayer {
                 media_type: layer.media_type,
-                data: layer.data,
+                data: layer.data.to_vec(),
                 digest: Some(digest),
             }
         })
         .collect();
-    let manifest_annotations = image.manifest.and_then(|m| m.annotations);
+    // `oci-client` returns these as a `BTreeMap`; `PulledImage` has always
+    // exposed a `HashMap` and changing that would break consumers.
+    let manifest_annotations = image
+        .manifest
+        .and_then(|m| m.annotations)
+        .map(|a| a.into_iter().collect());
     PulledImage {
         digest: image.digest,
         layers,
@@ -786,7 +958,7 @@ pub enum OciPackError {
     PullFailed {
         reference: String,
         #[source]
-        source: oci_distribution::errors::OciDistributionError,
+        source: oci_client::errors::OciDistributionError,
     },
     #[error("io error while caching `{reference}`: {source}")]
     Io {

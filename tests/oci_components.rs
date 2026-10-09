@@ -11,8 +11,8 @@ use greentic_distributor_client::oci_components::{
     OciComponentResolver, PulledImage, PulledLayer, RegistryClient, ResolvedComponent,
     ResolvedComponentDescriptor,
 };
-use oci_distribution::Reference;
-use oci_distribution::errors::OciDistributionError;
+use oci_client::Reference;
+use oci_client::errors::OciDistributionError;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 

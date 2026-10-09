@@ -22,6 +22,19 @@ impl HttpDistributorClient {
         Ok(Self { http, config })
     }
 
+    /// Build a client from a pre-constructed [`reqwest::Client`].
+    ///
+    /// Use this to supply a client configured for mutual TLS — e.g. one built by
+    /// `greentic-update`'s `tls::build_mtls_client` — so every distributor call
+    /// travels over the mTLS update channel. The caller owns all transport
+    /// configuration (client identity, root certificates, timeouts, proxy);
+    /// `config.request_timeout` is intentionally **not** re-applied on top of the
+    /// supplied client, since a `reqwest::Client`'s timeout is fixed at build time.
+    #[must_use]
+    pub fn with_client(http: reqwest::Client, config: DistributorClientConfig) -> Self {
+        Self { http, config }
+    }
+
     fn base_url(&self) -> Result<String, DistributorError> {
         self.config
             .base_url

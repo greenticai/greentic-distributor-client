@@ -404,6 +404,55 @@ async fn http_handles_bad_json() {
     );
 }
 
+#[tokio::test]
+async fn http_with_client_uses_supplied_client() {
+    let Some(server) = start_server() else {
+        eprintln!("skipping: unable to bind mock server in this environment");
+        return;
+    };
+    // A client with a distinctive user-agent: if the request carries it, the
+    // supplied client (not an internally-built default) served the call — this
+    // is the seam an mTLS client is injected through.
+    let injected = reqwest::Client::builder()
+        .user_agent("greentic-mtls-probe/1")
+        .build()
+        .unwrap();
+    let mock = server.mock(|when, then| {
+        when.method(GET)
+            .path("/distributor-api/pack-status")
+            .header("user-agent", "greentic-mtls-probe/1")
+            .query_param("tenant_id", "tenant-a")
+            .query_param("environment_id", "env-1")
+            .query_param("pack_id", "pack-123");
+        then.status(200).json_body(json!({"ready": 3}));
+    });
+    let config = DistributorClientConfig {
+        base_url: Some(server.base_url()),
+        environment_id: DistributorEnvironmentId::from("env-1"),
+        tenant: TenantCtx::new(
+            EnvId::try_from("dev").unwrap(),
+            TenantId::try_from("tenant-a").unwrap(),
+        ),
+        auth_token: None,
+        extra_headers: None,
+        request_timeout: None,
+    };
+    let client = HttpDistributorClient::with_client(injected, config);
+    let resp = client
+        .get_pack_status(
+            &TenantCtx::new(
+                EnvId::try_from("dev").unwrap(),
+                TenantId::try_from("tenant-a").unwrap(),
+            ),
+            &DistributorEnvironmentId::from("env-1"),
+            "pack-123",
+        )
+        .await
+        .unwrap();
+    mock.assert();
+    assert_eq!(resp["ready"], 3);
+}
+
 #[test]
 fn component_digest_sha256_like() {
     let digest = ComponentDigest(

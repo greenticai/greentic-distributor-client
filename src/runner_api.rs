@@ -4,17 +4,19 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use oci_distribution::Reference;
-use oci_distribution::client::{Client, ClientConfig, ClientProtocol, ImageData};
-use oci_distribution::errors::OciDistributionError;
-use oci_distribution::manifest::{
+use oci_client::Reference;
+use oci_client::client::{Client, ClientConfig, ClientProtocol, ImageData};
+use oci_client::errors::OciDistributionError;
+use oci_client::manifest::{
     IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE,
     OCI_IMAGE_MEDIA_TYPE,
 };
-use oci_distribution::secrets::RegistryAuth;
+use oci_client::secrets::RegistryAuth;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+use crate::oci_retry::{RetryPolicy, retry_transient};
 
 const OCI_ARTIFACT_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.artifact.manifest.v1+json";
 const DOCKER_MANIFEST_MEDIA_TYPE: &str = "application/vnd.docker.distribution.manifest.v2+json";
@@ -463,15 +465,29 @@ pub trait RegistryClient: Send + Sync {
     ) -> Result<PulledImage, OciDistributionError>;
 }
 
-/// Registry client backed by `oci-distribution` with HTTPS enforced and anonymous pulls.
+/// Registry client backed by `oci-client` with HTTPS enforced and anonymous pulls.
+///
+/// Transport failures are retried per [`RetryPolicy`]; see [`crate::oci_retry`]
+/// for what counts as transient. Test doubles implementing [`RegistryClient`]
+/// are unaffected and keep failing instantly.
 #[derive(Clone)]
 pub struct DefaultRegistryClient {
     inner: Client,
+    retry: RetryPolicy,
 }
 
 impl Default for DefaultRegistryClient {
     fn default() -> Self {
         Self::default_client()
+    }
+}
+
+impl DefaultRegistryClient {
+    /// Override the transport retry policy, which otherwise comes from
+    /// [`RetryPolicy::from_env`].
+    pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
     }
 }
 
@@ -484,6 +500,7 @@ impl RegistryClient for DefaultRegistryClient {
         };
         Self {
             inner: Client::new(config),
+            retry: RetryPolicy::from_env(),
         }
     }
 
@@ -492,14 +509,14 @@ impl RegistryClient for DefaultRegistryClient {
         reference: &Reference,
         accepted_manifest_types: &[&str],
     ) -> Result<PulledImage, OciDistributionError> {
-        let image = self
-            .inner
-            .pull(
+        let image = retry_transient(self.retry, &reference.to_string(), || {
+            self.inner.pull(
                 reference,
                 &RegistryAuth::Anonymous,
                 accepted_manifest_types.to_vec(),
             )
-            .await?;
+        })
+        .await?;
         Ok(convert_image(image))
     }
 }
@@ -512,7 +529,7 @@ fn convert_image(image: ImageData) -> PulledImage {
             let digest = format!("sha256:{}", layer.sha256_digest());
             PulledLayer {
                 media_type: Some(layer.media_type),
-                data: layer.data,
+                data: layer.data.to_vec(),
                 digest: Some(digest),
             }
         })
@@ -547,7 +564,7 @@ pub enum RunnerApiError {
     PullFailed {
         reference: String,
         #[source]
-        source: oci_distribution::errors::OciDistributionError,
+        source: oci_client::errors::OciDistributionError,
     },
     #[error("io error while handling `{reference}`: {source}")]
     Io {

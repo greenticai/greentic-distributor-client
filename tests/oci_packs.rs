@@ -14,8 +14,8 @@ use greentic_distributor_client::oci_packs::{
     OciPackError, OciPackFetcher, PackFetchOptions, PulledImage, PulledLayer, RegistryClient,
     default_pack_layer_media_types, fetch_pack_to_cache_with_options_and_client,
 };
-use oci_distribution::Reference;
-use oci_distribution::errors::OciDistributionError;
+use oci_client::Reference;
+use oci_client::errors::OciDistributionError;
 use sha2::{Digest, Sha256};
 use tar::{Archive, Builder, Header};
 use tempfile::TempDir;

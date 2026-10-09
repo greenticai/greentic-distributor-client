@@ -18,8 +18,8 @@ use greentic_distributor_client::{
     OciPackFetcher, PackFetchOptions, ResolvedPack,
     oci_packs::{PulledImage as PackPulledImage, PulledLayer as PackPulledLayer},
 };
-use oci_distribution::Reference;
-use oci_distribution::errors::OciDistributionError;
+use oci_client::Reference;
+use oci_client::errors::OciDistributionError;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 

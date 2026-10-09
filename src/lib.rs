@@ -14,6 +14,12 @@ mod http;
 pub mod oci_components;
 #[cfg(feature = "pack-fetch")]
 pub mod oci_packs;
+#[cfg(feature = "pack-push")]
+pub mod oci_push;
+#[cfg(feature = "oci-client")]
+pub mod oci_retry;
+#[cfg(any(feature = "pack-fetch", feature = "oci-components"))]
+pub mod oci_transport;
 #[cfg(feature = "runner-api")]
 pub mod runner_api;
 #[cfg(feature = "dist-client")]
@@ -45,6 +51,26 @@ pub use dist::{
 pub use error::DistributorError;
 #[cfg(feature = "http-runtime")]
 pub use http::HttpDistributorClient;
+/// Re-exported so downstream crates implementing `oci_push::RegistryPusher`
+/// (or consuming `oci_packs::RegistryClient`) can reference `Reference`,
+/// `OciDistributionError`, `ParseError`, etc. without taking their own
+/// `oci-client` dependency and having to keep it version-locked with
+/// this crate — a bump here would otherwise silently break them.
+#[cfg(any(
+    feature = "pack-fetch",
+    feature = "oci-components",
+    feature = "runner-api"
+))]
+pub use oci_client;
+
+/// Compatibility alias for the pre-rename crate name.
+///
+/// `oci-distribution` was renamed to `oci-client` upstream; this crate moved
+/// with it. The old path stays exported so a consumer that spells it
+/// `greentic_distributor_client::oci_distribution` keeps compiling across the
+/// bump, rather than being broken by a dependency's rename it had no part in.
+/// New code should use [`oci_client`].
+pub use oci_client as oci_distribution;
 #[cfg(feature = "oci-components")]
 pub use oci_components::{
     ComponentResolveOptions, ComponentsExtension, ComponentsMode, DefaultRegistryClient,
@@ -59,6 +85,10 @@ pub use oci_packs::{
     fetch_pack_to_cache_with_options_and_client, fetch_pack_with_options,
     fetch_pack_with_options_and_client,
 };
+#[cfg(feature = "pack-push")]
+pub use oci_push::{OciPushError, PushedPack, RegistryPusher, push_pack_with_client};
+#[cfg(feature = "oci-client")]
+pub use oci_retry::{RetryPolicy, error_chain, is_retryable, retry_transient};
 pub use signing::{
     DSSE_PAYLOAD_TYPE_INTOTO, DsseEnvelope, DsseSignature, INTOTO_STATEMENT_TYPE, InTotoStatement,
     SLSA_PROVENANCE_PREDICATE_TYPE, SigningError, SlsaProvenance, Subject, TrustRoot, TrustedKey,

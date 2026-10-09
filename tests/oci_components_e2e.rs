@@ -37,7 +37,7 @@ async fn fetches_public_component_from_ghcr() {
                 ..
             } if matches!(
                 &source,
-                oci_distribution::errors::OciDistributionError::RequestError(err)
+                oci_client::errors::OciDistributionError::RequestError(err)
                     if err.is_connect() || err.is_timeout()
             ) =>
             {

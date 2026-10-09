@@ -13,11 +13,11 @@ use crate::store_auth::{
 use async_trait::async_trait;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use oci_distribution::Reference;
-use oci_distribution::client::{Client, ClientConfig, ClientProtocol};
-use oci_distribution::errors::OciDistributionError;
-use oci_distribution::manifest::OciManifest;
-use oci_distribution::secrets::RegistryAuth;
+use oci_client::Reference;
+use oci_client::client::{Client, ClientConfig, ClientProtocol};
+use oci_client::errors::OciDistributionError;
+use oci_client::manifest::OciManifest;
+use oci_client::secrets::RegistryAuth;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1003,11 +1003,14 @@ impl StoreDownloadRegistryClient for DefaultStoreDownloadRegistryClient {
                 .into_iter()
                 .map(|layer| PulledLayer {
                     media_type: layer.media_type,
-                    data: layer.data,
+                    data: layer.data.to_vec(),
                     digest: None,
                 })
                 .collect(),
-            manifest_annotations: image.manifest.and_then(|m| m.annotations),
+            manifest_annotations: image
+                .manifest
+                .and_then(|m| m.annotations)
+                .map(|a| a.into_iter().collect()),
         })
     }
 }
@@ -5233,7 +5236,7 @@ mod tests {
         PulledImage as ComponentPulledImage, PulledLayer as ComponentPulledLayer,
     };
     use crate::oci_packs::{PulledImage as PackPulledImage, PulledLayer as PackPulledLayer};
-    use oci_distribution::manifest::{OciDescriptor, OciImageIndex, OciImageManifest};
+    use oci_client::manifest::{OciDescriptor, OciImageIndex, OciImageManifest};
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -5767,7 +5770,7 @@ mod tests {
     fn retries_store_resolution_as_pack_for_non_component_layers() {
         assert!(should_retry_store_as_pack(&OciComponentError::PullFailed {
             reference: "ghcr.io/greentic-biz/bundles/zain-x-bundle:latest".to_string(),
-            source: oci_distribution::errors::OciDistributionError::GenericError(Some(
+            source: oci_client::errors::OciDistributionError::GenericError(Some(
                 "Incompatible layer media type: application/vnd.greentic.zain-x.bundle.v1+tar+gzip"
                     .to_string(),
             )),
@@ -5800,6 +5803,7 @@ mod tests {
                 media_type: None,
                 manifests: Vec::new(),
                 annotations: None,
+                artifact_type: None,
             }));
 
         assert!(accepted.contains(&"application/vnd.greentic.gtpack.layer.v1+tar".to_string()));
@@ -5851,6 +5855,7 @@ mod tests {
                     size: 2,
                     annotations: None,
                     urls: None,
+                    artifact_type: None,
                 },
                 layers: vec![OciDescriptor {
                     media_type: media_type.clone(),
@@ -5858,9 +5863,11 @@ mod tests {
                     size: payload.len() as i64,
                     annotations: None,
                     urls: None,
+                    artifact_type: None,
                 }],
                 artifact_type: Some(media_type.clone()),
                 annotations: None,
+                subject: None,
             }),
             image: PulledImage {
                 digest: Some(digest.clone()),
